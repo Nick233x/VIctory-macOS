@@ -459,7 +459,7 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, &mut title) || title == host {
             return 0;
         }
-        if !crate::watch::copy_back_view(from, n, |dst| dst.copy_from_slice(host)) {
+        if !crate::watch::copy_back_bytes(from, host) {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
         }
@@ -745,9 +745,7 @@ impl Shadow {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     if merge_writeback(title, host, old) {
-                        if !crate::watch::copy_back_view(start + at, n, |dst| {
-                            dst.copy_from_slice(title)
-                        }) {
+                        if !crate::watch::copy_back_bytes(start + at, title) {
                             let _writing = crate::watch::writing(start + at, n);
                             crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         }
@@ -860,17 +858,31 @@ impl Shadow {
             let n = to - from;
             // SAFETY: inside the mapping; only the submitting thread writes it.
             let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-            title.resize(n, 0);
-            if !crate::host::read_into(from as *const u8, &mut title) {
-                continue;
-            }
-            let differs = match &saved {
-                // The title's bytes are the copy's from before: what differs
-                // is the shaders'.
-                None => *host != title[..],
-                Some(before) => {
-                    let before = &before[from - page..to - page];
-                    merge_writeback(&mut title, host, before)
+            let differs = if let Some(before_page) = &saved {
+                title.resize(n, 0);
+                let read_ok = crate::watch::read_own_view_chunks(from, n, |off, chunk| {
+                    title[off..off + chunk.len()].copy_from_slice(chunk);
+                });
+                if !read_ok && !crate::host::read_into(from as *const u8, &mut title) {
+                    continue;
+                }
+                let before = &before_page[from - page..to - page];
+                merge_writeback(&mut title, host, before)
+            } else {
+                let mut diff = false;
+                let read_ok = crate::watch::read_own_view_chunks(from, n, |off, chunk| {
+                    if !diff && host[off..off + chunk.len()] != *chunk {
+                        diff = true;
+                    }
+                });
+                if !read_ok {
+                    title.resize(n, 0);
+                    if !crate::host::read_into(from as *const u8, &mut title) {
+                        continue;
+                    }
+                    *host != title[..]
+                } else {
+                    diff
                 }
             };
             if differs {
@@ -893,7 +905,7 @@ impl Shadow {
             // SAFETY: this run is inside the shadow. The GPU is done and
             // widened_source keeps the merged bytes stable until the write.
             let src = unsafe { std::slice::from_raw_parts(self.data.add(from - start), len) };
-            if !crate::watch::copy_back_view(from, len, |dst| dst.copy_from_slice(src)) {
+            if !crate::watch::copy_back_bytes(from, src) {
                 let _writing = crate::watch::writing(from, len);
                 crate::host::write_mapped(from as *mut u8, src.as_ptr(), len);
             }
@@ -1190,7 +1202,9 @@ impl Shadow {
                 while cur < tail_start {
                     let chunk_end = ((cur / PAGE + 1) * PAGE).min(tail_start);
                     let chunk_len = chunk_end - cur;
-                    if !crate::watch::read_own_view(cur, chunk_len, |src| apply_slice(cur, src)) {
+                    if !crate::watch::read_own_view_chunks(cur, chunk_len, |off, src| {
+                        apply_slice(cur + off, src)
+                    }) {
                         SCRATCH.with_borrow_mut(|buf| {
                             buf.resize(chunk_len, 0);
                             crate::host::copy_mapped(

@@ -3669,6 +3669,30 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    if title_dst && len <= 256 << 10 {
+        thread_local! {
+            static COPY_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        #[cfg(feature = "diagnostics")]
+        let moved = std::time::Instant::now();
+        let copied_via_view = COPY_SCRATCH.with_borrow_mut(|buf| {
+            if buf.len() < len {
+                buf.resize(len, 0);
+            }
+            if !read(src, buf.as_mut_ptr(), len) {
+                return false;
+            }
+            crate::watch::copy_back_bytes(dst as usize, &buf[..len])
+        });
+        if copied_via_view {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::MoveUs,
+                moved.elapsed().as_micros() as u64,
+            );
+            return;
+        }
+    }
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]

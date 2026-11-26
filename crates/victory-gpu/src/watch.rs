@@ -907,18 +907,6 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
     out
 }
 
-/// Removes elements of sorted `excluded` from sorted `sorted` in linear time.
-fn exclude_sorted(sorted: &mut Vec<usize>, excluded: &[usize]) {
-    if excluded.is_empty() || sorted.is_empty() {
-        return;
-    }
-    let mut ex = excluded.iter().copied().peekable();
-    sorted.retain(|&p| {
-        while ex.next_if(|&e| e < p).is_some() {}
-        ex.next_if_eq(&p).is_none()
-    });
-}
-
 /// (page, other page) for the pages (page numbers) showing the same memory
 /// as `pages` elsewhere.
 fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
@@ -934,26 +922,14 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Guards the other mappings of taken pages (coalesced by address), returning
-/// sorted page numbers that still have an unguarded mapping (cannot be taken yet).
-fn guard_aliases(g: &mut Held, pairs: &[(usize, usize)]) -> Vec<usize> {
-    if pairs.is_empty() {
-        return Vec::new();
-    }
-    let mut others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    others.sort_unstable();
-    others.dedup();
-    // Pages in `alias_of` are registered `xmem` section views (`MapViewOfFile3`),
-    // never write-watched pools or foreign `MEM_PRIVATE` allocations.
-    let guarded = protect_inner(g, &others, None, true, |_| {});
-    let mut unguarded: Vec<usize> = pairs
-        .iter()
-        .filter(|(_, a)| guarded.binary_search(a).is_err())
-        .map(|&(p, _)| p)
-        .collect();
-    unguarded.sort_unstable();
-    unguarded.dedup();
-    unguarded
+/// If `page` lies in one of the sorted coalesced write-watched pool runs
+/// `watched`, returns that run's exclusive end page.
+fn watched_run_end(watched: &[(usize, usize)], page: usize) -> Option<usize> {
+    let i = watched.partition_point(|&(_, last)| last <= page);
+    watched
+        .get(i)
+        .filter(|&&(first, _)| first <= page)
+        .map(|&(_, last)| last)
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -1451,24 +1427,29 @@ impl Tracked {
             #[cfg(feature = "diagnostics")]
             let asked = Timed(Instant::now(), crate::copystat::C::AliasUs);
             let others = aliases(&g, &cold_whole);
-            let unguarded = guard_aliases(&mut g, &others);
             #[cfg(feature = "diagnostics")]
             drop(asked);
-            exclude_sorted(&mut cold_whole, &unguarded);
-            protect_inner(&mut g, &cold_whole, Some(&mut unmapped), false, |taken| {
-                let mut d = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-                for &page in taken {
-                    d.pages.remove(&page);
-                    d.hot.remove(&page);
-                    d.rearmed.remove(&page);
-                    if use_parts && self.is_watched_page(page) {
-                        taken_whole_watched.push(page);
+            protect_with_aliases(
+                &mut g,
+                &cold_whole,
+                &others,
+                &self.watched,
+                Some(&mut unmapped),
+                |taken| {
+                    let mut d = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+                    for &page in taken {
+                        d.pages.remove(&page);
+                        d.hot.remove(&page);
+                        d.rearmed.remove(&page);
+                        if use_parts && self.is_watched_page(page) {
+                            taken_whole_watched.push(page);
+                        }
                     }
-                }
-                set_dirty(self.changed.2, !d.is_empty());
-                drop(d);
-                self.changed.taken_many(taken);
-            })
+                    set_dirty(self.changed.2, !d.is_empty());
+                    drop(d);
+                    self.changed.taken_many(taken);
+                },
+            )
         };
         let _ = &guarded;
 
@@ -1543,19 +1524,24 @@ impl Tracked {
             cool_for_gpu(&mut g, &sorted, None);
         }
         let others = aliases(&g, &sorted);
-        let unguarded = guard_aliases(&mut g, &others);
-        exclude_sorted(&mut sorted, &unguarded);
-        let protected = protect_inner(&mut g, &sorted, None, false, |taken| {
-            let mut d = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-            for &page in taken {
-                d.pages.remove(&page);
-                d.hot.remove(&page);
-                d.rearmed.remove(&page);
-            }
-            set_dirty(self.changed.2, !d.is_empty());
-            drop(d);
-            self.changed.taken_many(taken);
-        });
+        let protected = protect_with_aliases(
+            &mut g,
+            &sorted,
+            &others,
+            &self.watched,
+            None,
+            |taken| {
+                let mut d = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+                for &page in taken {
+                    d.pages.remove(&page);
+                    d.hot.remove(&page);
+                    d.rearmed.remove(&page);
+                }
+                set_dirty(self.changed.2, !d.is_empty());
+                drop(d);
+                self.changed.taken_many(taken);
+            },
+        );
         drop(g);
         if page_parts_on() && !self.watched.is_empty() && !protected.is_empty() {
             let mut watched_runs: Vec<(usize, usize)> = Vec::new();
@@ -1704,14 +1690,20 @@ impl Tracked {
 /// nothing mapped; mapped pages that could not be guarded or were concurrently
 /// faulted/opened are left out.
 fn protect(g: &mut Held, pages: &[usize]) -> Vec<usize> {
-    protect_inner(g, pages, None, false, |_| {})
+    protect_with_aliases(g, pages, &[], &[], None, |_| {})
 }
 
-fn protect_inner(
+/// Guards sorted `pages` AND all alias pages in `pairs` (`(page, alias_page)`)
+/// in a single unlocked `PROTECT_SYSCALL` batch, avoiding two separate `GUARDS`
+/// / `PROTECT_SYSCALL` round trips per take. Commits only those `page`s in
+/// `pages` that are now guarded (or unmapped) AND whose aliases in `pairs` are
+/// all guarded.
+fn protect_with_aliases(
     g: &mut Held,
     pages: &[usize],
+    pairs: &[(usize, usize)],
+    watched: &[(usize, usize)],
     mut unmapped_pages: Option<&mut Vec<usize>>,
-    known_views: bool,
     on_commit: impl FnOnce(&[usize]),
 ) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
@@ -1723,33 +1715,70 @@ fn protect_inner(
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(Instant::now(), crate::copystat::C::ProtectUs);
 
-    let mut taken = Vec::with_capacity(pages.len());
-    let mut candidates: Vec<(usize, Option<usize>)> = Vec::new();
+    let mut alias_pages: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
+    alias_pages.sort_unstable();
+    alias_pages.dedup();
+
+    // Every unique page across `pages ∪ alias_pages` that is not already
+    // protected, busy, opening, or mid-guarding becomes one candidate in the
+    // single unlocked syscall batch.
+    let mut eligible_pages = Vec::with_capacity(pages.len());
+    // `(page, known_region_end, known_view)`
+    let mut candidates: Vec<(usize, Option<usize>, bool)> = Vec::new();
     let op_id = g.next_guard_op;
     g.next_guard_op = g.next_guard_op.wrapping_add(1).max(1);
 
-    for &page in pages {
+    let mut enqueue = |g: &mut Guards, page: usize, is_alias: bool| -> bool {
         if is_busy(g, page) || is_opening(g, page) {
-            continue;
+            return false;
         }
         if g.protected.contains(&page) {
-            taken.push(page);
-            continue;
+            return true;
         }
         if g.guarding.contains_key(&page) {
-            // Another thread is already guarding `page`; leave it dirty for us.
-            continue;
+            return false;
         }
         g.guarding.insert(page, (op_id, false));
-        candidates.push((page, xmem_view_end(g, page)));
+        let end = xmem_view_end(g, page).or_else(|| {
+            if is_alias {
+                None
+            } else {
+                watched_run_end(watched, page)
+            }
+        });
+        candidates.push((page, end, is_alias));
+        true
+    };
+
+    for &page in pages {
+        if enqueue(g, page, false) {
+            eligible_pages.push(page);
+        }
+    }
+    for &alias in &alias_pages {
+        if pages.binary_search(&alias).is_err() {
+            let _ = enqueue(g, alias, true);
+        }
     }
 
     if candidates.is_empty() {
-        taken.sort_unstable();
-        taken.dedup();
-        on_commit(&taken);
-        return taken;
+        let mut committed: Vec<usize> = eligible_pages
+            .into_iter()
+            .filter(|&p| {
+                g.protected.contains(&p)
+                    && pairs
+                        .iter()
+                        .filter(|&&(src, _)| src == p)
+                        .all(|&(_, a)| g.protected.contains(&a))
+            })
+            .collect();
+        committed.sort_unstable();
+        committed.dedup();
+        on_commit(&committed);
+        return committed;
     }
+
+    candidates.sort_unstable_by_key(|&(p, _, _)| p);
 
     let (succeeded, unmapped_found, calls, protected_pages) = g.unlock_for(|| {
         let _syscall = PROTECT_SYSCALL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1780,9 +1809,9 @@ fn protect_inner(
         let mut allowed = RuntimeRegions::default();
         let mut accepted: Vec<(usize, usize)> = Vec::with_capacity(candidates.len());
         let mut hole_pages = Vec::new();
-        for &(p, view_end) in &candidates {
+        for &(p, known_end, known_views) in &candidates {
             if !check_guard {
-                if let Some(end) = view_end {
+                if let Some(end) = known_end {
                     accepted.push((p, end));
                     continue;
                 }
@@ -1843,7 +1872,7 @@ fn protect_inner(
     // faulted/opened or remapped, so it must stay dirty and be reopened to
     // `PAGE_READWRITE` before `GUARDING_CV` wakes waiters.
     let mut cancelled_set = BTreeSet::new();
-    for &(page, _) in &candidates {
+    for &(page, _, _) in &candidates {
         if let Some(&(id, cancelled)) = g.guarding.get(&page)
             && id == op_id
         {
@@ -1862,15 +1891,34 @@ fn protect_inner(
             reopen_cancelled.push(page);
         } else {
             g.protected.insert(page);
-            taken.push(page);
         }
     }
+    let mut unmapped_ok = BTreeSet::new();
     for page in unmapped_found {
         if !cancelled_set.contains(&page) {
-            taken.push(page);
-            if let Some(out) = unmapped_pages.as_deref_mut() {
-                out.push(page);
-            }
+            unmapped_ok.insert(page);
+        }
+    }
+
+    // Check `g.protected` AFTER re-acquiring `GUARDS` so any page (or alias)
+    // that was already protected before `unlock_for` and concurrently faulted
+    // while unlocked is excluded from `taken` and stays dirty.
+    let mut taken = Vec::with_capacity(eligible_pages.len());
+    for p in eligible_pages {
+        let is_unmapped = unmapped_ok.contains(&p);
+        if !is_unmapped && !g.protected.contains(&p) {
+            continue;
+        }
+        let aliases_ok = pairs
+            .iter()
+            .filter(|&&(src, _)| src == p)
+            .all(|&(_, a)| g.protected.contains(&a) || unmapped_ok.contains(&a));
+        if !aliases_ok {
+            continue;
+        }
+        taken.push(p);
+        if is_unmapped && let Some(out) = unmapped_pages.as_deref_mut() {
+            out.push(p);
         }
     }
 
@@ -1883,7 +1931,7 @@ fn protect_inner(
     // Commit tracker state atomically under `GUARDS` before `open_sorted_pages`
     // unlocks `GUARDS` to reopen cancelled pages: otherwise a newly guarded page
     // in `taken` could fault and reopen while unlocked, only for the caller to
-    // clear its dirty flag after `protect_inner` returns.
+    // clear its dirty flag after `protect_with_aliases` returns.
     on_commit(&taken);
 
     if !reopen_cancelled.is_empty() {
@@ -2121,10 +2169,7 @@ fn cool_for_gpu(g: &mut Held, pages: &[usize], rearm: Option<(&Arc<Changed>, usi
         guard_now.sort_unstable();
         guard_now.dedup();
         let others = aliases(g, &guard_now);
-        let unguarded = guard_aliases(g, &others);
-        let mut to_protect = guard_now.clone();
-        exclude_sorted(&mut to_protect, &unguarded);
-        let guarded = protect(g, &to_protect);
+        let guarded = protect_with_aliases(g, &guard_now, &others, &[], None, |_| {});
         if guarded.len() < guard_now.len()
             && let Some((owner, _, _)) = rearm
         {
@@ -2323,6 +2368,13 @@ fn advance_frame(g: &mut Guards) {
 /// [`GUARDS`] across `VirtualProtect`) and marks them in every tracker holding
 /// them. True if one of `[first, last)` was guarded (or mid-guarding).
 fn changed(g: &mut Held, first: usize, last: usize, save: bool) -> bool {
+    changed_inner(g, first, last, save, true)
+}
+
+/// Like [`changed`], with `open_self = false` when the OS mapping for
+/// `[first, last)` was already unmapped or freshly mapped read-write so no
+/// `VirtualProtect(PAGE_READWRITE)` syscall is needed on `[first, last)`.
+fn changed_inner(g: &mut Held, first: usize, last: usize, save: bool, open_self: bool) -> bool {
     let mut to_open: Vec<usize> = g.protected.range(first..last).copied().collect();
     let mut cancelled_guarding = false;
     for (_, (_, cancelled)) in g.guarding.range_mut(first..last) {
@@ -2332,6 +2384,9 @@ fn changed(g: &mut Held, first: usize, last: usize, save: bool) -> bool {
     let guarded = !to_open.is_empty() || cancelled_guarding;
     for &p in &to_open {
         g.protected.remove(&p);
+    }
+    if !open_self {
+        to_open.clear();
     }
 
     let others: Vec<usize> = g
@@ -2406,9 +2461,10 @@ pub(crate) fn frame_done() {
     advance_frame(&mut g);
 }
 
-/// The memory runtime pins a writable section view and the corresponding title
-/// mapping for the duration of the closure. False means no bytes were touched.
-type CopyBackView = fn(usize, usize, &mut dyn FnMut(&mut [u8])) -> bool;
+/// The memory runtime pins writable section views covering `[at, at + len)`
+/// for the duration of the closure, passing contiguous segments in address
+/// order. False means no bytes were touched.
+type CopyBackView = fn(usize, usize, &mut dyn FnMut(&mut [&mut [u8]])) -> bool;
 static COPY_BACK_VIEW: OnceLock<CopyBackView> = OnceLock::new();
 
 pub fn use_copy_back_view(view: CopyBackView) {
@@ -2416,9 +2472,13 @@ pub fn use_copy_back_view(view: CopyBackView) {
 }
 
 /// Saves armed snapshots and notifies every tracker before changing the shared
-/// section bytes through an unguarded view, keeping title page guards intact.
-fn write_through_view(at: usize, dst: &mut [u8], copy: &mut dyn FnMut(&mut [u8])) {
-    let len = dst.len();
+/// section bytes through unguarded views, keeping title page guards intact.
+fn write_through_view(
+    at: usize,
+    slices: &mut [&mut [u8]],
+    copy: &mut dyn FnMut(&mut [&mut [u8]]),
+) {
+    let len: usize = slices.iter().map(|s| s.len()).sum();
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     {
         let mut g = guards();
@@ -2431,18 +2491,29 @@ fn write_through_view(at: usize, dst: &mut [u8], copy: &mut dyn FnMut(&mut [u8])
         for page in others {
             mark_changed(&mut g, page, page + 1, true);
         }
-        copy(dst);
+        copy(slices);
     }
     note_subpages_bytes(at, len);
 }
 
-pub(crate) fn copy_back_view(at: usize, len: usize, mut copy: impl FnMut(&mut [u8])) -> bool {
-    if !back_own_view_on() {
+/// Writes `src` into title memory at `at` through unguarded `xmem` section
+/// views, keeping title page guards intact across single- and multi-view spans.
+pub(crate) fn copy_back_bytes(at: usize, src: &[u8]) -> bool {
+    if !back_own_view_on() || src.is_empty() {
         return false;
     }
-    let stored = COPY_BACK_VIEW
-        .get()
-        .is_some_and(|view| view(at, len, &mut |dst| write_through_view(at, dst, &mut copy)));
+    let stored = COPY_BACK_VIEW.get().is_some_and(|view| {
+        view(at, src.len(), &mut |slices| {
+            write_through_view(at, slices, &mut |dsts| {
+                let mut off = 0;
+                for dst in dsts.iter_mut() {
+                    let n = dst.len();
+                    dst.copy_from_slice(&src[off..off + n]);
+                    off += n;
+                }
+            });
+        })
+    });
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -2452,22 +2523,32 @@ pub(crate) fn copy_back_view(at: usize, len: usize, mut copy: impl FnMut(&mut [u
             } else {
                 C::OwnBackMissBytes
             },
-            len as u64,
+            src.len() as u64,
         );
     }
     stored
 }
 
 /// Reads `[at, at + len)` directly from the runtime's pinned `xmem` section
-/// view in userspace without kernel `ReadProcessMemory` calls or touching title
-/// page guards; returns `false` if unavailable or concurrently borrowed.
-pub(crate) fn read_own_view(at: usize, len: usize, mut read: impl FnMut(&[u8])) -> bool {
-    if !back_own_view_on() {
+/// views in userspace without kernel `ReadProcessMemory` calls or touching
+/// title page guards; invokes `read(byte_offset, chunk)` for each segment.
+pub(crate) fn read_own_view_chunks(
+    at: usize,
+    len: usize,
+    mut read: impl FnMut(usize, &[u8]),
+) -> bool {
+    if !back_own_view_on() || len == 0 {
         return false;
     }
-    COPY_BACK_VIEW
-        .get()
-        .is_some_and(|view| view(at, len, &mut |src| read(src)))
+    COPY_BACK_VIEW.get().is_some_and(|view| {
+        view(at, len, &mut |slices| {
+            let mut off = 0;
+            for src in slices.iter() {
+                read(off, src);
+                off += src.len();
+            }
+        })
+    })
 }
 
 /// A write into title memory the guards do not see, under way: its pages
@@ -2529,19 +2610,53 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    title_memory_remapped_inner(at, len, false);
-}
-
-/// The runtime mapped a live `xmem` section view over `[at, at + len)`:
-/// notifies trackers as [`title_memory_remapped`] and records the view span so
-/// [`protect_inner`] can protect it without per-view `VirtualQuery` calls.
-pub fn title_memory_mapped(at: usize, len: usize) {
-    title_memory_remapped_inner(at, len, true);
-}
-
-fn title_memory_remapped_inner(at: usize, len: usize, mapped: bool) {
-    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    title_memory_remapped_under(&mut g, at, len, false, true);
+    drop(g);
+    note_subpages_whole(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+}
+
+/// The runtime already unmapped `[at, at + len)` back to a placeholder: drops
+/// guard state and notifies trackers without issuing a redundant
+/// `VirtualProtect(PAGE_READWRITE)` on the unmapped range.
+pub fn title_memory_unmapped(at: usize, len: usize) {
+    let mut g = guards();
+    title_memory_remapped_under(&mut g, at, len, false, false);
+    drop(g);
+    note_subpages_whole(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+}
+
+/// The runtime mapped a live `xmem` section view over `[at, at + len)` (fresh
+/// `PAGE_READWRITE`): notifies trackers and records the view span without
+/// issuing a redundant `VirtualProtect(PAGE_READWRITE)` on `[at, at + len)`.
+pub fn title_memory_mapped(at: usize, len: usize) {
+    let mut g = guards();
+    title_memory_remapped_under(&mut g, at, len, true, false);
+    drop(g);
+    note_subpages_whole(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+}
+
+/// Combined [`title_memory_mapped`] + batched [`title_memory_aliased`] for all
+/// aliased pages of a newly mapped `xmem` view in one `GUARDS` acquisition and
+/// one coalesced `protect` batch.
+pub fn title_memory_mapped_aliased(base: usize, len: usize, aliased: &[(usize, Vec<usize>)]) {
+    let mut g = guards();
+    title_memory_remapped_under(&mut g, base, len, true, false);
+    if !aliased.is_empty() {
+        register_aliases_under(&mut g, aliased);
+    }
+    drop(g);
+    note_subpages_whole(base / PAGE, base.saturating_add(len).div_ceil(PAGE));
+}
+
+fn title_memory_remapped_under(
+    g: &mut Held,
+    at: usize,
+    len: usize,
+    mapped: bool,
+    open_self: bool,
+) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut reset: Vec<usize> = g
         .hot
         .range(first..last)
@@ -2578,7 +2693,7 @@ fn title_memory_remapped_inner(at: usize, len: usize, mapped: bool) {
             HOT_COUNT.store(g.hot.len(), Ordering::Release);
         }
         if rest_changed {
-            sync_resting_atomics(&g);
+            sync_resting_atomics(g);
         }
     }
     let clear_keys: Vec<usize> = g
@@ -2595,7 +2710,7 @@ fn title_memory_remapped_inner(at: usize, len: usize, mapped: bool) {
         g.cooled_frame.remove(&p);
         g.gpu_until.remove(&p);
     }
-    changed(&mut g, first, last, false);
+    changed_inner(g, first, last, false, open_self);
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
         for other in g.alias_of.remove(&page).unwrap_or_default() {
@@ -2607,12 +2722,10 @@ fn title_memory_remapped_inner(at: usize, len: usize, mapped: bool) {
             }
         }
     }
-    remove_xmem_views(&mut g, first, last);
+    remove_xmem_views(g, first, last);
     if mapped && first < last {
         g.xmem_views.insert(first, last);
     }
-    drop(g);
-    note_subpages_whole(first, last);
 }
 
 /// Reports GPU shader writes into aliased title memory `[at, at + len)` so
@@ -2677,49 +2790,85 @@ fn mark_copies(g: &Guards, first: usize, last: usize) {
 /// pages are linked both ways, and if we guard it there, it is guarded here
 /// too.
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
+    if others.is_empty() {
+        return;
+    }
     let mut g = guards();
-    let page = at / PAGE;
-    for &other in others {
-        for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
-            let links = g.alias_of.entry(x).or_default();
-            if !links.contains(&y) {
-                links.push(y);
-            }
-        }
-    }
-    if let Some(until) = others
-        .iter()
-        .filter_map(|&o| g.gpu_until.get(&(o / PAGE)).copied())
-        .max()
-    {
-        g.gpu_until.insert(page, until);
-    }
+    register_aliases_under(&mut g, &[(at, others.to_vec())]);
+}
+
+fn register_aliases_under(g: &mut Held, aliased: &[(usize, Vec<usize>)]) {
     let other_guarded = |g: &Guards, o: usize| {
         g.protected.contains(&(o / PAGE))
             || g.guarding.get(&(o / PAGE)).is_some_and(|&(_, c)| !c)
     };
-    if is_busy(&g, page) || is_opening(&g, page) {
-        if others.iter().any(|&o| other_guarded(&g, o)) {
-            changed(&mut g, page, page + 1, false);
+    let mut hot_changed = false;
+    let mut rest_changed = false;
+    let mut to_guard: Vec<usize> = Vec::new();
+    let mut busy_mark: Vec<usize> = Vec::new();
+
+    for (at, others) in aliased {
+        if others.is_empty() {
+            continue;
         }
-        return;
+        let page = at / PAGE;
+        for &other in others {
+            for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
+                let links = g.alias_of.entry(x).or_default();
+                if !links.contains(&y) {
+                    links.push(y);
+                }
+            }
+        }
+        if let Some(until) = others
+            .iter()
+            .filter_map(|&o| g.gpu_until.get(&(o / PAGE)).copied())
+            .max()
+        {
+            g.gpu_until.insert(page, until);
+        }
+        if is_busy(g, page) || is_opening(g, page) {
+            if others.iter().any(|&o| other_guarded(g, o)) {
+                busy_mark.push(page);
+            }
+            continue;
+        }
+        if let Some(until) = others
+            .iter()
+            .filter_map(|&o| g.hot.get(&(o / PAGE)).copied())
+            .max()
+        {
+            g.hot.insert(page, until);
+            hot_changed = true;
+        } else if let Some(until_ns) = others
+            .iter()
+            .filter_map(|&o| g.resting.get(&(o / PAGE)).copied())
+            .max()
+        {
+            g.resting.insert(page, until_ns);
+            rest_changed = true;
+        } else if others.iter().any(|&o| other_guarded(g, o)) {
+            to_guard.push(page);
+        }
     }
-    if let Some(until) = others
-        .iter()
-        .filter_map(|&o| g.hot.get(&(o / PAGE)).copied())
-        .max()
-    {
-        g.hot.insert(page, until);
+    if hot_changed {
         HOT_COUNT.store(g.hot.len(), Ordering::Release);
-    } else if let Some(until_ns) = others
-        .iter()
-        .filter_map(|&o| g.resting.get(&(o / PAGE)).copied())
-        .max()
-    {
-        g.resting.insert(page, until_ns);
-        sync_resting_atomics(&g);
-    } else if others.iter().any(|&o| other_guarded(&g, o)) && protect(&mut g, &[page]).is_empty() {
-        changed(&mut g, page, page + 1, false);
+    }
+    if rest_changed {
+        sync_resting_atomics(g);
+    }
+    for page in busy_mark {
+        changed(g, page, page + 1, false);
+    }
+    if !to_guard.is_empty() {
+        to_guard.sort_unstable();
+        to_guard.dedup();
+        let guarded = protect(g, &to_guard);
+        for page in to_guard {
+            if guarded.binary_search(&page).is_err() {
+                changed(g, page, page + 1, false);
+            }
+        }
     }
 }
 
@@ -4143,7 +4292,8 @@ pub(crate) mod tests {
             tracker.arm(base, base + PAGE);
         }
         let mut dest = [0u8; 1];
-        write_through_view(a + 17, &mut dest, &mut |out| out[0] = 5);
+        let mut slices = [&mut dest[..]];
+        write_through_view(a + 17, &mut slices, &mut |out| out[0][0] = 5);
         assert_eq!(dest, [5]);
         for (tracker, base) in [(&first, a), (&other, b)] {
             assert!(read_only(base), "title page guard stays read-only");
@@ -4787,5 +4937,60 @@ pub(crate) mod tests {
 
         drop(t);
         free(p);
+    }
+
+    #[test]
+    fn protect_with_aliases_handles_busy_alias_and_guards_clean_siblings() {
+        let (a, b) = twin_views(2);
+        let t = track(a, 2 * PAGE, true).expect("views tracked");
+        // Hold alias page 0 busy so page 0 cannot be committed, while page 1
+        // and its alias are both guarded in the same batch and page 1 commits.
+        let busy = writing(b, PAGE);
+        let taken = t.take(a, a + 2 * PAGE);
+        assert_eq!(taken, vec![(a, a + 2 * PAGE)]);
+        assert!(t.changed(a / PAGE), "page 0 stays dirty while its alias is busy");
+        assert!(!t.changed(a / PAGE + 1), "page 1 commits cleanly");
+        assert!(read_only(a + PAGE) && read_only(b + PAGE));
+        drop(busy);
+        // Once the alias is no longer busy, page 0 and its alias both guard and commit.
+        let again = t.take(a, a + 2 * PAGE);
+        assert_eq!(again, vec![(a, a + PAGE)]);
+        assert!(t.clean());
+        assert!(read_only(a) && read_only(b));
+        drop(t);
+    }
+
+    #[test]
+    fn title_memory_mapped_aliased_batches_multi_page_alias_guards() {
+        let (a, b) = twin_views(4);
+        let t = track(a, 4 * PAGE, true).expect("views tracked");
+        // Clear initial alias links from `twin_views` so we can test batched
+        // `title_memory_mapped_aliased` on a freshly mapped 4-page view `b`.
+        title_memory_unmapped(b, 4 * PAGE);
+        assert_eq!(t.take(a, a + 4 * PAGE), vec![(a, a + 4 * PAGE)]);
+        for k in 0..4 {
+            assert!(read_only(a + k * PAGE));
+        }
+
+        let aliased: Vec<(usize, Vec<usize>)> = (0..4)
+            .map(|k| (b + k * PAGE, vec![a + k * PAGE]))
+            .collect();
+        with_check_page_guard(false, || {
+            PROTECTS.with(|n| n.set(0));
+            title_memory_mapped_aliased(b, 4 * PAGE, &aliased);
+            let calls = PROTECTS.with(|n| n.get());
+            assert_eq!(
+                calls, 1,
+                "4-page contiguous aliased view must guard in one VirtualProtect call"
+            );
+        });
+        for k in 0..4 {
+            assert!(read_only(b + k * PAGE), "alias page {k} is guarded");
+        }
+        // `title_memory_unmapped` clears guard tracking without issuing an OS
+        // reopen on the unmapped range.
+        title_memory_unmapped(b, 4 * PAGE);
+        assert!(!guards().protected.contains(&(b / PAGE)));
+        drop(t);
     }
 }

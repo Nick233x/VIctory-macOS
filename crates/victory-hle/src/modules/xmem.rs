@@ -935,40 +935,154 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
-/// Pins the title mapping and its section while GPU results are written
-/// through our own unguarded section view. A remap, a split range, or an
-/// overlapping DirectStorage borrow falls back to the regular guarded write
-/// path. Only Wine commits whole sections at creation.
-pub(super) fn copy_back_view(at: usize, len: usize, write: &mut dyn FnMut(&mut [u8])) -> bool {
+/// Pins the title mappings and their sections covering `[at, at + len)` while
+/// GPU results (or title copies) read or write through our own unguarded
+/// section views. Lazily maps any unmapped persistent section view OUTSIDE
+/// [`PHYSICAL`] so `MapViewOfFile` never runs while `PHYSICAL` is held.
+/// Returns `false` if any part of `[at, at + len)` is unmapped, spans
+/// overlapping physical bytes, or overlaps an active DirectStorage borrow.
+pub(super) fn copy_back_view(
+    at: usize,
+    len: usize,
+    write: &mut dyn FnMut(&mut [&mut [u8]]),
+) -> bool {
     if len == 0 || !on_wine() {
         return false;
     }
-    let Ok(physical) = PHYSICAL.try_lock() else {
+    let Some(end) = at.checked_add(len) else {
         return false;
     };
-    let Some((&base, (size, slice))) = physical.views.range(..=at).next_back() else {
-        return false;
-    };
-    let offset = at - base;
-    if offset > *size || len > size - offset {
-        return false;
+    enum Plan {
+        Ready(Vec<(Arc<Section>, usize, usize)>),
+        NeedMap(Vec<Arc<Section>>),
+        Unmapped,
     }
-    let Some(whole) = slice.section.existing_whole() else {
-        return false;
+    let plan_under = |physical: &Physical| -> Plan {
+        let mut cur = at;
+        let mut segments: Vec<(Arc<Section>, usize, usize)> = Vec::new();
+        let mut missing: Vec<Arc<Section>> = Vec::new();
+        while cur < end {
+            let Some((&base, (size, slice))) = physical.views.range(..=cur).next_back() else {
+                return Plan::Unmapped;
+            };
+            let view_end = base.saturating_add(*size);
+            if cur >= view_end {
+                return Plan::Unmapped;
+            }
+            let take = (end - cur).min(view_end - cur);
+            let offset = cur - base;
+            if let Some(whole) = slice.section.existing_whole() {
+                let start = whole + slice.index * PAGE + offset;
+                if missing.is_empty() {
+                    match segments.last_mut() {
+                        Some((prev_sec, prev_start, prev_len))
+                            if Arc::ptr_eq(prev_sec, &slice.section)
+                                && *prev_start + *prev_len == start =>
+                        {
+                            *prev_len += take;
+                        }
+                        _ => segments.push((slice.section.clone(), start, take)),
+                    }
+                }
+            } else if !missing.iter().any(|s| Arc::ptr_eq(s, &slice.section)) {
+                missing.push(slice.section.clone());
+            }
+            cur += take;
+        }
+        if !missing.is_empty() {
+            Plan::NeedMap(missing)
+        } else {
+            Plan::Ready(segments)
+        }
     };
-    let start = whole + slice.index * PAGE + offset;
-    let end = start + len;
-    let Ok(borrowed) = slice.section.borrowed.try_lock() else {
-        return false;
-    };
-    if borrowed.iter().any(|r| start < r.end && r.start < end) {
-        return false;
+
+    for attempt in 0..2 {
+        let physical = physical();
+        match plan_under(&physical) {
+            Plan::Unmapped => return false,
+            Plan::NeedMap(missing) => {
+                drop(physical);
+                if attempt != 0 {
+                    return false;
+                }
+                for section in missing {
+                    if section.whole().is_none() {
+                        return false;
+                    }
+                }
+                continue;
+            }
+            Plan::Ready(segments) => {
+                if let [(section, start, seg_len)] = segments.as_slice() {
+                    let seg_end = start + seg_len;
+                    let Ok(borrowed) = section.borrowed.try_lock() else {
+                        return false;
+                    };
+                    if borrowed.iter().any(|r| *start < r.end && r.start < seg_end) {
+                        return false;
+                    }
+                    // SAFETY: `physical` pins the committed section and
+                    // `borrowed` excludes concurrent borrows of these bytes.
+                    let dst =
+                        unsafe { std::slice::from_raw_parts_mut(*start as *mut u8, *seg_len) };
+                    let mut one = [dst];
+                    write(&mut one);
+                    return true;
+                }
+                // Reject overlapping physical ranges so `&mut [u8]` slices
+                // never alias the same bytes within one call.
+                for i in 0..segments.len() {
+                    let (ref sec_a, start_a, len_a) = segments[i];
+                    let end_a = start_a + len_a;
+                    for (sec_b, start_b, len_b) in &segments[i + 1..] {
+                        if Arc::ptr_eq(sec_a, sec_b)
+                            && start_a < *start_b + *len_b
+                            && *start_b < end_a
+                        {
+                            return false;
+                        }
+                    }
+                }
+                let mut unique_sections: Vec<Arc<Section>> = Vec::new();
+                for (sec, _, _) in &segments {
+                    if !unique_sections.iter().any(|s| Arc::ptr_eq(s, sec)) {
+                        unique_sections.push(sec.clone());
+                    }
+                }
+                unique_sections.sort_unstable_by_key(|s| Arc::as_ptr(s) as usize);
+                let mut locks = Vec::with_capacity(unique_sections.len());
+                for sec in &unique_sections {
+                    let Ok(guard) = sec.borrowed.try_lock() else {
+                        return false;
+                    };
+                    for (seg_sec, start, seg_len) in &segments {
+                        if Arc::ptr_eq(seg_sec, sec)
+                            && guard
+                                .iter()
+                                .any(|r| *start < r.end && r.start < *start + *seg_len)
+                        {
+                            return false;
+                        }
+                    }
+                    locks.push(guard);
+                }
+                let mut slices: Vec<&mut [u8]> = segments
+                    .iter()
+                    .map(|&(_, start, seg_len)| {
+                        // SAFETY: `physical` pins all committed sections,
+                        // `locks` exclude concurrent borrows, and pairwise
+                        // disjointness was verified above.
+                        unsafe { std::slice::from_raw_parts_mut(start as *mut u8, seg_len) }
+                    })
+                    .collect();
+                write(&mut slices);
+                drop(slices);
+                drop(locks);
+                return true;
+            }
+        }
     }
-    // SAFETY: `physical` pins the committed section and `borrowed` excludes
-    // concurrent borrows of these bytes in our persistent section view.
-    let dst = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) };
-    write(dst);
-    true
+    false
 }
 
 /// The page a title view shows at `at`, if any.
@@ -1049,15 +1163,17 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it, and
-    // the view span is registered so guarding skips per-view `VirtualQuery`.
-    victory_gpu::title_memory_mapped(base, len);
+    let mut aliased = Vec::new();
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
-        // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
+        if !shown.is_empty() {
+            aliased.push((base + k * PAGE, shown.clone()));
+        }
         shown.push(base + k * PAGE);
     }
+    // New contents, read-write: register the view span and all alias links in
+    // one `GUARDS` acquisition and one coalesced `VirtualProtect` batch.
+    victory_gpu::title_memory_mapped_aliased(base, len, &aliased);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1189,8 +1305,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
+        // SAFETY: a view we mapped; it becomes a placeholder again before we
+        // clear guard state so `title_memory_unmapped` skips redundant opens.
         unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
@@ -1200,6 +1316,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        victory_gpu::title_memory_unmapped(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -1783,7 +1900,7 @@ mod tests {
         let pages = allocate(2);
         let at = XMemVirtualAlloc(
             std::ptr::null_mut(),
-            PAGE,
+            2 * PAGE,
             MEM_RESERVE | PAGES_64K,
             0,
             PAGE_READWRITE,
@@ -1793,29 +1910,59 @@ mod tests {
         for (i, &page) in pages.iter().enumerate() {
             assert_eq!(XMemMapPhysicalPages(at, 1, &page), at);
             if i == 0 {
-                // Before the persistent section view is mapped, `copy_back_view`
-                // must not call `MapViewOfFile` while holding `PHYSICAL`.
-                #[cfg(not(feature = "diagnostics"))]
-                assert!(!copy_back_view(dest, 1, &mut |_| panic!(
-                    "must not lazily map section view under PHYSICAL"
-                )));
+                // First call lazily maps the persistent section view outside
+                // `PHYSICAL` so GPU heap sections never miss indefinitely.
+                assert!(copy_back_view(dest, 1, &mut |slices| {
+                    assert_eq!(slices.len(), 1);
+                    slices[0][0] = 0x42;
+                }));
+                assert_eq!(page_bytes(page)[11], 0x42);
             }
             let window = page_window(&[page], 11, 4).unwrap();
             assert!(!copy_back_view(dest, 1, &mut |_| panic!(
                 "storage is using these bytes"
             )));
             drop(window);
-            assert!(copy_back_view(dest, 1, &mut |bytes| bytes[0] = 7 + i as u8));
+            assert!(copy_back_view(dest, 1, &mut |slices| {
+                assert_eq!(slices.len(), 1);
+                slices[0][0] = 7 + i as u8;
+            }));
             assert_eq!(page_bytes(page)[11], 7 + i as u8);
             // SAFETY: the mapped title address aliases this section.
             let seen = unsafe { (dest as *const u8).read_volatile() };
             assert_eq!(seen, 7 + i as u8);
+            // Second page is still unmapped, so crossing into it returns false.
             assert!(!copy_back_view(dest, PAGE, &mut |_| panic!(
-                "crosses a mapping"
+                "crosses into unmapped hole"
             )));
         }
-        assert_eq!(page_bytes(pages[0])[11], 7);
-        assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null()), at);
+        // Map both pages in reverse order as two scattered 64 KiB views and
+        // verify a single multi-page `copy_back_view` spans both cleanly.
+        let reversed = [pages[1], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(at, 1, &reversed[0]), at);
+        assert_eq!(
+            XMemMapPhysicalPages((at as usize + PAGE) as *mut c_void, 1, &reversed[1]),
+            (at as usize + PAGE) as *mut c_void
+        );
+        assert!(copy_back_view(at as usize + PAGE - 2, 4, &mut |slices| {
+            assert_eq!(slices.len(), 2);
+            slices[0].copy_from_slice(&[0xaa, 0xbb]);
+            slices[1].copy_from_slice(&[0xcc, 0xdd]);
+        }));
+        assert_eq!(&page_bytes(pages[1])[PAGE - 2..PAGE], &[0xaa, 0xbb]);
+        assert_eq!(&page_bytes(pages[0])[0..2], &[0xcc, 0xdd]);
+
+        // Mapping the same physical page twice side-by-side must return false
+        // to avoid creating aliasing `&mut [u8]` slices.
+        assert_eq!(
+            XMemMapPhysicalPages((at as usize + PAGE) as *mut c_void, 1, &reversed[0]),
+            (at as usize + PAGE) as *mut c_void
+        );
+        assert!(!copy_back_view(at as usize, 2 * PAGE, &mut |_| panic!(
+            "overlapping physical page must fall back"
+        )));
+
+        assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
         assert!(!copy_back_view(dest, 1, &mut |_| panic!("unmapped")));
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
