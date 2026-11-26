@@ -3589,6 +3589,17 @@ pub(crate) mod tests {
         f()
     }
 
+    /// The frame clock (`Guards::frame`), for one test at a time. Hot
+    /// leases, the fault window and the guard rest all count its frames,
+    /// and [`frame_done`] advances it for every test in the process: run
+    /// alongside each other, one test's frames cooled another's hot page
+    /// early or kept it from being promoted (#399). Every test that turns
+    /// hot pages or the guard rest on, or calls [`frame_done`], holds this.
+    fn frame_clock() -> std::sync::MutexGuard<'static, ()> {
+        static CLOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn with_hot_pages<R>(on: bool, f: impl FnOnce() -> R) -> R {
         struct Reset(Option<bool>);
         impl Drop for Reset {
@@ -3874,6 +3885,7 @@ pub(crate) mod tests {
 
     #[test]
     fn hot_pages_skip_reguard_and_cool_down_after_idle_frames() {
+        let _clock = frame_clock();
         let p = pool(2);
         with_hot_pages(true, || {
             let a = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
@@ -3938,6 +3950,7 @@ pub(crate) mod tests {
 
     #[test]
     fn arming_a_hot_page_reguards_immediately_and_saves_bytes() {
+        let _clock = frame_clock();
         let p = pool(1);
         with_hot_pages(true, || {
             let t = track_copy(p, PAGE, true).expect("tracked");
@@ -3988,6 +4001,7 @@ pub(crate) mod tests {
 
     #[test]
     fn remapping_clears_hot_page_state() {
+        let _clock = frame_clock();
         let p = pool(1);
         with_hot_pages(true, || {
             let t = track_copy(p, PAGE, true).expect("tracked");
@@ -4016,6 +4030,7 @@ pub(crate) mod tests {
 
     #[test]
     fn gpu_copy_back_cools_hot_page_without_false_title_change() {
+        let _clock = frame_clock();
         let p = pool(1);
         with_hot_pages(true, || {
             let t = track_copy(p, PAGE, true).expect("tracked");
@@ -4049,6 +4064,7 @@ pub(crate) mod tests {
 
     #[test]
     fn guard_rest_keeps_recently_faulted_page_open_and_reguards_after_expiry() {
+        let _clock = frame_clock();
         let p = pool(1);
         with_hot_pages(false, || {
             let t = track_copy(p, PAGE, true).expect("tracked");
@@ -4120,6 +4136,7 @@ pub(crate) mod tests {
     /// until `A` cools down.
     #[test]
     fn repeated_writes_through_aliased_views_promote_hot_with_zero_protects() {
+        let _clock = frame_clock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, VirtualAlloc2,
@@ -4327,6 +4344,7 @@ pub(crate) mod tests {
 
     #[test]
     fn guarded_and_hot_pools_take_only_written_4k_subpages() {
+        let _clock = frame_clock();
         let p = pool(3);
         with_page_parts(true, || {
             let a = track_copy(p, 3 * PAGE, true).expect("pool tracked");
@@ -4386,6 +4404,7 @@ pub(crate) mod tests {
     /// + wait reduction and `VirtualProtect` savings.
     #[test]
     fn multithreaded_fault_and_take_contention_preserves_writes_and_cuts_lock_wait() {
+        let _clock = frame_clock();
         const THREADS: usize = 6;
         const PAGES_PER_THREAD: usize = 4;
         const TOTAL_PAGES: usize = THREADS * PAGES_PER_THREAD;
