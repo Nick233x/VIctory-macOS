@@ -20,8 +20,9 @@ use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
+    SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -105,6 +106,9 @@ pub extern "system" fn XMemVirtualAlloc(
         0 => PAGE_NOACCESS,
         p => p,
     };
+    if protect & PAGE_GUARD != 0 {
+        victory_gpu::note_page_guard();
+    }
     // A reservation of 64 KiB pages takes physical pages later
     // (`XMemMapPhysicalPages`); on the host only a placeholder can.
     // shortcut: committing part of such a reservation later would fail
@@ -385,12 +389,15 @@ struct Section {
     #[cfg(feature = "diagnostics")]
     shared: Option<victory_gpu::PhysicalHeap>,
     /// Our own view of the whole section, mapped the first time a
-    /// DirectStorage request writes its pages and kept while the section
-    /// lives (0: it could not be mapped). A view per request cost a map
-    /// and an unmap, and under Wine each holds the process's one
+    /// DirectStorage request or GPU copy-back writes its pages and kept while
+    /// the section lives (0: it could not be mapped). A view per request cost
+    /// a map and an unmap, and under Wine each holds the process's one
     /// virtual-memory lock across a wineserver request: every page fault
     /// and protection change on other threads waits for it (#50).
     whole: OnceLock<usize>,
+    /// Active byte ranges borrowed from `whole` so disjoint subpage writes
+    /// share the persistent section view while overlapping ones map their own.
+    borrowed: Mutex<Vec<std::ops::Range<usize>>>,
 }
 
 // SAFETY: a section handle may be used from any thread, and the view is
@@ -400,6 +407,16 @@ unsafe impl Send for Section {}
 unsafe impl Sync for Section {}
 
 impl Section {
+    /// The address of our persistent view if already mapped (never calls
+    /// `MapViewOfFile`, safe to call while holding [`PHYSICAL`]).
+    fn existing_whole(&self) -> Option<usize> {
+        #[cfg(feature = "diagnostics")]
+        if let Some(shared) = &self.shared {
+            return Some(shared.cpu_address());
+        }
+        self.whole.get().copied().filter(|&at| at != 0)
+    }
+
     /// The address of our view of the whole section, mapped the first time;
     /// `None` if the host would not map it.
     fn whole(&self) -> Option<usize> {
@@ -581,6 +598,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         #[cfg(feature = "diagnostics")]
         shared: victory_gpu::physical_heap(size),
         whole: OnceLock::new(),
+        borrowed: Mutex::new(Vec::new()),
     });
     let mut physical = physical();
     let first = physical.next_page;
@@ -636,19 +654,36 @@ struct View {
 }
 
 impl View {
-    /// `n` slices from `slice` on.
-    fn map(slice: &Slice, n: usize) -> Option<View> {
+    /// A request's byte range relative to the first page of a consecutive
+    /// run. Only these bytes are borrowed from the section-wide view.
+    fn map(slice: &Slice, bytes: std::ops::Range<usize>) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
-        let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        let offset = slice.index.checked_mul(PAGE)?;
+        let len = bytes.end.checked_sub(bytes.start)?;
+        if offset.checked_add(bytes.end)? > slice.section.size {
+            return None;
+        }
+        let mapped_len = bytes.end.max(1).next_multiple_of(PAGE);
+        let offset = offset as u64;
         let section = slice.section.clone();
         if let Some(whole) = section.whole() {
-            let at = whole + offset as usize;
-            return commit(at, len).then_some(View {
-                at,
-                len,
-                own: None,
-                _section: section,
-            });
+            let base = whole + offset as usize;
+            let at = base + bytes.start;
+            let range = at..at + len;
+            let mut borrowed = section.borrowed.lock().unwrap_or_else(|e| e.into_inner());
+            if len == 0 || !borrowed.iter().any(|r| r.start < range.end && range.start < r.end) {
+                if len > 0 {
+                    borrowed.push(range);
+                }
+                drop(borrowed);
+                let view = View {
+                    at,
+                    len,
+                    own: None,
+                    _section: section,
+                };
+                return commit(base, mapped_len).then_some(view);
+            }
         }
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let own = unsafe {
@@ -657,19 +692,26 @@ impl View {
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
-                len,
+                mapped_len,
             )
         };
         if own.Value.is_null() {
             return None;
         }
+        let committed = commit(own.Value as usize, mapped_len);
+        #[cfg(feature = "diagnostics")]
+        let committed = committed
+            && section.shared.as_ref().is_none_or(|shared| {
+                // SAFETY: `own` is our live `mapped_len`-byte view of `section`.
+                unsafe { shared.alias_view(own.Value as usize, slice.index * PAGE, mapped_len) }
+            });
         let view = View {
-            at: own.Value as usize,
+            at: own.Value as usize + bytes.start,
             len,
             own: Some(own),
             _section: section,
         };
-        commit(view.at, len).then_some(view)
+        committed.then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -686,6 +728,9 @@ impl Drop for View {
         if let Some(own) = self.own {
             // SAFETY: the view this mapped.
             unsafe { UnmapViewOfFile(own) };
+        } else if self.len > 0 {
+            let mut borrowed = self._section.borrowed.lock().unwrap_or_else(|e| e.into_inner());
+            borrowed.retain(|range| range.start != self.at);
         }
     }
 }
@@ -725,11 +770,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+        let k = (n * PAGE - within).min(data.len() - done);
+        let Some(mut view) = View::map(slice, within..within + k) else {
             return false;
         };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        view.bytes().copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
     // Where the pages show once written (see `PageWindow`).
@@ -742,8 +787,6 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// would then copy.
 pub(crate) struct PageWindow {
     view: View,
-    within: usize,
-    len: usize,
     /// The pages (page numbers) the bytes reach: the title views showing
     /// them when the window is done are told. Looked up then, not when the
     /// window opens: a decode takes milliseconds, and the title may map a
@@ -761,8 +804,7 @@ impl Drop for PageWindow {
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
-        let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        self.view.bytes()
     }
 }
 
@@ -773,13 +815,12 @@ impl PageWindow {
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
     let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
+    let [(slice, _)] = runs.as_slice() else {
         return None;
     };
+    let start = offset % PAGE;
     Some(PageWindow {
-        view: View::map(slice, *n)?,
-        within: offset % PAGE,
-        len,
+        view: View::map(slice, start..start + len)?,
         pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
     })
 }
@@ -894,6 +935,42 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// Pins the title mapping and its section while GPU results are written
+/// through our own unguarded section view. A remap, a split range, or an
+/// overlapping DirectStorage borrow falls back to the regular guarded write
+/// path. Only Wine commits whole sections at creation.
+pub(super) fn copy_back_view(at: usize, len: usize, write: &mut dyn FnMut(&mut [u8])) -> bool {
+    if len == 0 || !on_wine() {
+        return false;
+    }
+    let Ok(physical) = PHYSICAL.try_lock() else {
+        return false;
+    };
+    let Some((&base, (size, slice))) = physical.views.range(..=at).next_back() else {
+        return false;
+    };
+    let offset = at - base;
+    if offset > *size || len > size - offset {
+        return false;
+    }
+    let Some(whole) = slice.section.existing_whole() else {
+        return false;
+    };
+    let start = whole + slice.index * PAGE + offset;
+    let end = start + len;
+    let Ok(borrowed) = slice.section.borrowed.try_lock() else {
+        return false;
+    };
+    if borrowed.iter().any(|r| start < r.end && r.start < end) {
+        return false;
+    }
+    // SAFETY: `physical` pins the committed section and `borrowed` excludes
+    // concurrent borrows of these bytes in our persistent section view.
+    let dst = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) };
+    write(dst);
+    true
+}
+
 /// The page a title view shows at `at`, if any.
 fn slice_at(physical: &Physical, at: usize) -> Option<Slice> {
     physical
@@ -972,8 +1049,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    // New contents, read-write: the GPU side's copies no longer guard it, and
+    // the view span is registered so guarding skips per-view `VirtualQuery`.
+    victory_gpu::title_memory_mapped(base, len);
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         // Pages shown elsewhere already: guarded here too if they are there.
@@ -1576,7 +1654,7 @@ mod tests {
     /// The bytes of one page, through our view of its section.
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
-        View::map(&slice, 1).expect("mapped").bytes().to_vec()
+        View::map(&slice, 0..PAGE).expect("mapped").bytes().to_vec()
     }
 
     #[test]
@@ -1679,6 +1757,70 @@ mod tests {
     }
 
     #[test]
+    fn independent_writes_within_a_page_share_its_view() {
+        let pages = allocate(1);
+        let mut first = page_window(&pages, 32, 16).unwrap();
+        let mut next = page_window(&pages, 48, 16).unwrap();
+        assert!(first.view.own.is_none() && next.view.own.is_none());
+        first.bytes().fill(1);
+        next.bytes().fill(2);
+        let empty = page_window(&pages, 32, 0).unwrap();
+        drop(empty);
+        let overlap = page_window(&pages, 47, 2).unwrap();
+        assert!(overlap.view.own.is_some());
+        drop((overlap, first, next));
+        let bytes = page_bytes(pages[0]);
+        assert_eq!(&bytes[32..48], &[1; 16]);
+        assert_eq!(&bytes[48..64], &[2; 16]);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn copy_back_uses_only_the_current_unborrowed_mapping() {
+        if !on_wine() {
+            return;
+        }
+        let pages = allocate(2);
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!at.is_null());
+        let dest = at as usize + 11;
+        for (i, &page) in pages.iter().enumerate() {
+            assert_eq!(XMemMapPhysicalPages(at, 1, &page), at);
+            if i == 0 {
+                // Before the persistent section view is mapped, `copy_back_view`
+                // must not call `MapViewOfFile` while holding `PHYSICAL`.
+                #[cfg(not(feature = "diagnostics"))]
+                assert!(!copy_back_view(dest, 1, &mut |_| panic!(
+                    "must not lazily map section view under PHYSICAL"
+                )));
+            }
+            let window = page_window(&[page], 11, 4).unwrap();
+            assert!(!copy_back_view(dest, 1, &mut |_| panic!(
+                "storage is using these bytes"
+            )));
+            drop(window);
+            assert!(copy_back_view(dest, 1, &mut |bytes| bytes[0] = 7 + i as u8));
+            assert_eq!(page_bytes(page)[11], 7 + i as u8);
+            // SAFETY: the mapped title address aliases this section.
+            let seen = unsafe { (dest as *const u8).read_volatile() };
+            assert_eq!(seen, 7 + i as u8);
+            assert!(!copy_back_view(dest, PAGE, &mut |_| panic!(
+                "crosses a mapping"
+            )));
+        }
+        assert_eq!(page_bytes(pages[0])[11], 7);
+        assert_eq!(XMemMapPhysicalPages(at, 1, std::ptr::null()), at);
+        assert!(!copy_back_view(dest, 1, &mut |_| panic!("unmapped")));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn page_writes_share_one_view_of_their_section() {
         let a = allocate(3);
         let slice = |p| physical().pages.get(&p).cloned().expect("known page");
@@ -1686,14 +1828,21 @@ mod tests {
         // Every request on the section goes through the same view, each
         // page at its place in it, with no view of its own to map and unmap.
         let (first, third) = (
-            View::map(&slice(a[0]), 1).expect("mapped"),
-            View::map(&slice(a[2]), 1).expect("mapped"),
+            View::map(&slice(a[0]), 0..PAGE).expect("mapped"),
+            View::map(&slice(a[2]), 0..PAGE).expect("mapped"),
         );
         assert_eq!(third.at - first.at, 2 * PAGE);
         assert!(first.own.is_none() && third.own.is_none());
+        let overlap = View::map(&slice(a[0]), 0..2 * PAGE).expect("mapped");
+        assert!(overlap.own.is_some());
+        assert_ne!(overlap.at, first.at);
+        drop(overlap);
         let at = first.at;
         drop((first, third));
-        assert_eq!(View::map(&slice(a[1]), 2).expect("mapped").at, at + PAGE);
+        assert_eq!(
+            View::map(&slice(a[1]), 0..2 * PAGE).expect("mapped").at,
+            at + PAGE
+        );
         assert!(write_physical(&a, 2 * PAGE + 3, &[4, 5]));
         assert_eq!(page_bytes(a[2])[3..5], [4, 5]);
         // The view lives as long as the section: until its pages are freed.

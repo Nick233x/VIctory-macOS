@@ -66,6 +66,13 @@ fn writeback_merge_matches_bytewise_oracle() {
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    /// 4 KiB title pages (relative to `start / KERNEL_PAGE`) where GPU copy-back
+    /// wrote bytes since a refresh last checked them ([`Shadow::copy_or_landed`]).
+    landings: Mutex<Vec<u64>>,
+    landing: AtomicBool,
+    /// 4 KiB title pages already copied at least once into `data`
+    /// ([`Shadow::copy_changed_4k`]).
+    seeded: Mutex<Vec<u64>>,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -452,10 +459,11 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, &mut title) || title == host {
             return 0;
         }
-        {
+        if !crate::watch::copy_back_view(from, n, |dst| dst.copy_from_slice(host)) {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
         }
+        self.note_landing(from - start, to - start);
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
             t.taken(&[page / PAGE]);
@@ -480,6 +488,9 @@ impl Shadow {
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
+            landings: Mutex::default(),
+            landing: AtomicBool::new(false),
+            seeded: Mutex::default(),
             buffer,
             data,
             gpu,
@@ -513,6 +524,9 @@ impl Shadow {
     ) -> Arc<Shadow> {
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
+            landings: Mutex::default(),
+            landing: AtomicBool::new(false),
+            seeded: Mutex::default(),
             buffer,
             data,
             gpu,
@@ -731,8 +745,13 @@ impl Shadow {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     if merge_writeback(title, host, old) {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        if !crate::watch::copy_back_view(start + at, n, |dst| {
+                            dst.copy_from_slice(title)
+                        }) {
+                            let _writing = crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        }
+                        self.note_landing(at, at + n);
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
@@ -871,11 +890,14 @@ impl Shadow {
         let mut written = 0;
         for (from, to) in writes {
             let len = to - from;
-            let _writing = crate::watch::writing(from, len);
             // SAFETY: this run is inside the shadow. The GPU is done and
             // widened_source keeps the merged bytes stable until the write.
-            let src = unsafe { self.data.add(from - start) };
-            crate::host::write_mapped(from as *mut u8, src, len);
+            let src = unsafe { std::slice::from_raw_parts(self.data.add(from - start), len) };
+            if !crate::watch::copy_back_view(from, len, |dst| dst.copy_from_slice(src)) {
+                let _writing = crate::watch::writing(from, len);
+                crate::host::write_mapped(from as *mut u8, src.as_ptr(), len);
+            }
+            self.note_landing(from - start, to - start);
             written += len;
         }
         if !taken.is_empty() {
@@ -949,21 +971,21 @@ impl Shadow {
             for (a, e) in busy {
                 let (a, e) = (a.max(from), e.min(to));
                 if a > at {
-                    bytes += self.update_untracked(at, a);
+                    bytes += self.update_untracked(at, a, false);
                 }
                 if e > a.max(at) {
                     let (a, e) = (a.max(at), e);
-                    bytes += self.update_untracked(a, e);
+                    bytes += self.update_untracked(a, e, true);
                     self.sync_snapshot(a, e);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_untracked(at, to);
+                bytes += self.update_untracked(at, to, false);
             }
             return bytes;
         }
-        self.update_untracked(from, to)
+        self.update_untracked(from, to, false)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where the
@@ -998,9 +1020,16 @@ impl Shadow {
             }
         };
         let mut copied = 0;
+        let check_echo = self.landing.load(Ordering::Acquire) && land_echo();
         for (a, b) in runs {
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            if check_echo {
+                copied += self.copy_or_landed(a, b, busy, &mut sync_before);
+            } else if !busy {
+                copied += self.copy_changed_4k(a, b);
+            } else {
+                copied += self.copy(a, b);
+                sync_before(a, b);
+            }
         }
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
@@ -1016,8 +1045,12 @@ impl Shadow {
         for (a, b) in t.untracked(from, to) {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            if !busy {
+                copied += self.copy_changed_4k(a, b);
+            } else {
+                copied += self.copy(a, b);
+                sync_before(a, b);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1056,17 +1089,148 @@ impl Shadow {
     }
 
     /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
-    fn update_untracked(&self, from: usize, to: usize) -> usize {
+    fn update_untracked(&self, from: usize, to: usize, busy: bool) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let copied = if busy {
+            self.copy(from, to)
+        } else {
+            self.copy_changed_4k(from, to)
+        };
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
-            add(C::WholeBytes, (to - from) as u64);
+            add(C::WholeBytes, copied as u64);
             add(C::WholeUs, started.elapsed().as_micros() as u64);
         }
-        to - from
+        copied
+    }
+
+    /// Copies title memory `[from, to)` into the copy, comparing aligned 4 KiB
+    /// subpages in userspace once seeded so unchanged 4 KiB subpages inside a
+    /// dirty or hot 64 KiB page are skipped without syscalls. Large or unseeded
+    /// runs take a single whole-range copy directly into `self.data`.
+    fn copy_changed_4k(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        if to - from < KERNEL_PAGE || to - from > COMPARE_4K_MAX_BYTES || !compare_4k() {
+            self.mark_seeded_range(from, to);
+            return self.copy(from, to);
+        }
+        let head_end = from.next_multiple_of(KERNEL_PAGE).min(to);
+        let tail_start = (to / KERNEL_PAGE * KERNEL_PAGE).max(head_end);
+        let mut copied = 0usize;
+        if from < head_end {
+            self.mark_seeded_range(from, head_end);
+            copied += self.copy(from, head_end);
+        }
+        if head_end < tail_start {
+            let first = start / KERNEL_PAGE;
+            let base_page = head_end / KERNEL_PAGE - first;
+            let page_count = (tail_start - head_end) / KERNEL_PAGE;
+            let mut was_seeded = vec![false; page_count];
+            let mut any_seeded = false;
+            {
+                let mut seeded = self.seeded.lock().unwrap_or_else(|e| e.into_inner());
+                if seeded.is_empty() {
+                    let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
+                    seeded.resize(all.div_ceil(64), 0);
+                }
+                for (i, slot) in was_seeded.iter_mut().enumerate() {
+                    let page = base_page + i;
+                    let mask = 1u64 << (page % 64);
+                    let word = &mut seeded[page / 64];
+                    let seen = (*word & mask) != 0;
+                    *slot = seen;
+                    any_seeded |= seen;
+                    *word |= mask;
+                }
+            }
+            if !any_seeded {
+                copied += self.copy(head_end, tail_start);
+            } else {
+                let mut apply_slice = |slice_from: usize, src: &[u8]| {
+                    let mut off = 0usize;
+                    while off < src.len() {
+                        let at = slice_from + off;
+                        let next = at + KERNEL_PAGE;
+                        let idx = (at - head_end) / KERNEL_PAGE;
+                        let src_4k = &src[off..off + KERNEL_PAGE];
+                        // SAFETY: `at..next` lies within `start..end`, and `widened_source`
+                        // is held by `Shadow::update`.
+                        let held = unsafe {
+                            std::slice::from_raw_parts_mut(self.data.add(at - start), KERNEL_PAGE)
+                        };
+                        if was_seeded[idx] && src_4k == held {
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::add(
+                                crate::copystat::C::EchoSkippedBytes,
+                                KERNEL_PAGE as u64,
+                            );
+                        } else {
+                            held.copy_from_slice(src_4k);
+                            if self.has_widened.load(Ordering::Acquire) {
+                                self.refresh_widened(at, next);
+                            }
+                            if let Some(t) = &self.tracked {
+                                t.refreshed(at, held);
+                            }
+                            copied += KERNEL_PAGE;
+                        }
+                        off += KERNEL_PAGE;
+                    }
+                };
+                thread_local! {
+                    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+                }
+                let mut cur = head_end;
+                while cur < tail_start {
+                    let chunk_end = ((cur / PAGE + 1) * PAGE).min(tail_start);
+                    let chunk_len = chunk_end - cur;
+                    if !crate::watch::read_own_view(cur, chunk_len, |src| apply_slice(cur, src)) {
+                        SCRATCH.with_borrow_mut(|buf| {
+                            buf.resize(chunk_len, 0);
+                            crate::host::copy_mapped(
+                                buf.as_mut_ptr(),
+                                cur as *const u8,
+                                chunk_len,
+                                false,
+                            );
+                            apply_slice(cur, buf);
+                        });
+                    }
+                    cur = chunk_end;
+                }
+            }
+        }
+        if tail_start < to {
+            self.mark_seeded_range(tail_start, to);
+            copied += self.copy(tail_start, to);
+        }
+        copied
+    }
+
+    fn mark_seeded_range(&self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let start = self.start as usize;
+        let first = start / KERNEL_PAGE;
+        let lo = from / KERNEL_PAGE - first;
+        let hi = to.div_ceil(KERNEL_PAGE) - first;
+        let mut seeded = self.seeded.lock().unwrap_or_else(|e| e.into_inner());
+        if seeded.is_empty() {
+            let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
+            seeded.resize(all.div_ceil(64), 0);
+        }
+        for page in lo..hi {
+            if let Some(word) = seeded.get_mut(page / 64) {
+                *word |= 1u64 << (page % 64);
+            }
+        }
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -1085,6 +1249,195 @@ impl Shadow {
         }
         to - from
     }
+
+    /// Marks 4 KiB title pages overlapping shadow byte offsets `[from, to)` as
+    /// written by GPU copy-back so the next refresh can skip unchanged echoes.
+    fn note_landing(&self, from: usize, to: usize) {
+        if from >= to || !land_echo() {
+            return;
+        }
+        let start = self.start as usize;
+        let first = start / KERNEL_PAGE;
+        let lo = (start + from) / KERNEL_PAGE - first;
+        let hi = (start + to).div_ceil(KERNEL_PAGE) - first;
+        let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+        if bits.is_empty() {
+            let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
+            bits.resize(all.div_ceil(64), 0);
+        }
+        for page in lo..hi {
+            if let Some(word) = bits.get_mut(page / 64) {
+                *word |= 1u64 << (page % 64);
+            }
+        }
+        self.landing.store(true, Ordering::Release);
+    }
+
+    /// Copies `[from, to)` into the shadow, skipping 4 KiB pages noted by
+    /// [`Shadow::note_landing`] whose title-memory bytes still match `self.data`.
+    fn copy_or_landed(
+        &self,
+        from: usize,
+        to: usize,
+        busy: bool,
+        sync_before: &mut impl FnMut(usize, usize),
+    ) -> usize {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let first = start / KERNEL_PAGE;
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        {
+            let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+            let mut at = from;
+            while at < to {
+                let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+                let page = at / KERNEL_PAGE - first;
+                let noted = bits
+                    .get(page / 64)
+                    .is_some_and(|word| (word >> (page % 64)) & 1 != 0);
+                if noted && next - at == KERNEL_PAGE {
+                    bits[page / 64] &= !(1u64 << (page % 64));
+                }
+                match runs.last_mut() {
+                    Some(last) if last.2 == noted && next - last.0 <= PAGE => last.1 = next,
+                    _ => runs.push((at, next, noted)),
+                }
+                at = next;
+            }
+            if bits.iter().all(|&w| w == 0) {
+                self.landing.store(false, Ordering::Release);
+            }
+        }
+        let mut copied = 0usize;
+        TITLE.with_borrow_mut(|title_buf| {
+            for (r_from, r_to, noted) in runs {
+                if !noted {
+                    if !busy {
+                        copied += self.copy_changed_4k(r_from, r_to);
+                    } else {
+                        copied += self.copy(r_from, r_to);
+                        sync_before(r_from, r_to);
+                    }
+                    continue;
+                }
+                self.mark_seeded_range(r_from, r_to);
+                title_buf.resize(r_to - r_from, 0);
+                crate::host::copy_mapped(
+                    title_buf.as_mut_ptr(),
+                    r_from as *const u8,
+                    r_to - r_from,
+                    false,
+                );
+                let mut at = r_from;
+                while at < r_to {
+                    let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(r_to);
+                    let len = next - at;
+                    let title_slice = &title_buf[at - r_from..next - r_from];
+                    // SAFETY: `at..next` lies within `start..end`, and `widened_source`
+                    // is held by `Shadow::update`.
+                    let held =
+                        unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), len) };
+                    if title_slice == held {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::EchoSkippedBytes, len as u64);
+                    } else {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::EchoChangedBytes, len as u64);
+                        held.copy_from_slice(title_slice);
+                        if self.has_widened.load(Ordering::Acquire) {
+                            self.refresh_widened(at, next);
+                        }
+                        if let Some(t) = &self.tracked {
+                            t.refreshed(at, held);
+                        }
+                        sync_before(at, next);
+                        copied += len;
+                    }
+                    at = next;
+                }
+            }
+        });
+        copied
+    }
+}
+
+const KERNEL_PAGE: usize = 4096;
+
+/// Upper bound for 4 KiB userspace subpage comparison in [`Shadow::copy_changed_4k`];
+/// larger runs copy whole in one kernel read instead of chunking into 64 KiB reads.
+const COMPARE_4K_MAX_BYTES: usize = 256 << 10;
+
+/// Whether refreshes compare 4 KiB pages written by GPU copy-back against
+/// `self.data` and skip unchanged echoes (`VICTORY_LAND_ECHO=0` disables).
+fn land_echo() -> bool {
+    #[cfg(test)]
+    if let Some(on) = LAND_ECHO_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LAND_ECHO").as_deref() != Ok("0"))
+}
+
+/// Whether forward refreshes compare seeded 4 KiB subpages in userspace and
+/// skip unchanged ones (`VICTORY_SHADOW_COMPARE_4K=0` disables; on by default
+/// outside `cfg!(test)`, where batch tests count 64 KiB page refreshes unless
+/// `with_compare_4k` or `VICTORY_SHADOW_COMPARE_4K=1` is set).
+fn compare_4k() -> bool {
+    #[cfg(test)]
+    if let Some(on) = COMPARE_4K_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        decide_compare_4k(
+            std::env::var("VICTORY_SHADOW_COMPARE_4K").ok().as_deref(),
+            cfg!(test),
+        )
+    })
+}
+
+fn decide_compare_4k(var: Option<&str>, is_test: bool) -> bool {
+    match var {
+        Some("1") => true,
+        Some("0") => false,
+        _ => !is_test,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAND_ECHO_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static COMPARE_4K_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn with_compare_4k<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COMPARE_4K_OVERRIDE.with(|e| e.set(self.0));
+        }
+    }
+    let _reset = Reset(COMPARE_4K_OVERRIDE.with(|e| e.replace(Some(on))));
+    f()
+}
+
+#[cfg(test)]
+fn with_land_echo<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LAND_ECHO_OVERRIDE.with(|e| e.set(self.0));
+        }
+    }
+    let _reset = Reset(LAND_ECHO_OVERRIDE.with(|e| e.replace(Some(on))));
+    f()
 }
 
 impl Drop for Shadow {
@@ -3281,5 +3634,136 @@ pub(crate) mod tests {
         assert!(ranges_disjoint(&[(0x1000, 0x1000), (0x2000, 0x1000)]));
         assert!(ranges_disjoint(&[(0x2000, 0x1000), (0x1000, 0x1000)]));
         assert!(!ranges_disjoint(&[(0x1000, 0x1500), (0x2000, 0x1000)]));
+    }
+
+    #[test]
+    fn landed_gpu_writes_skip_redundant_echo_refresh_unless_title_modified() {
+        if host().is_none() {
+            return;
+        }
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return;
+        };
+        with_land_echo(true, || {
+            assert_eq!(copy.update(p, PAGE), PAGE);
+            copy.writing(p, PAGE, false);
+            copy.write_host((p + 16) as u64, &[0xde, 0xad, 0xbe, 0xef]);
+            copy.write_host((p + 5 * KERNEL_PAGE + 8) as u64, &[0xca, 0xfe]);
+            assert_eq!(copy.copy_back(p, PAGE), PAGE);
+
+            // Force a retake of the page without modifying title memory: all 16
+            // 4 KiB chunks match `copy.data`, so `copy_or_landed` copies 0 bytes!
+            crate::watch::retake(p, PAGE);
+            assert_eq!(
+                copy.update(p, PAGE),
+                0,
+                "unchanged GPU copy-back echo must skip redundant host re-copy"
+            );
+
+            // Note another landing, then modify subpage 3 on the CPU: only the
+            // 4 KiB subpage touched by the title is copied!
+            copy.note_landing(0, PAGE);
+            // SAFETY: inside `p..p + PAGE`.
+            unsafe { ((p + 3 * KERNEL_PAGE + 4) as *mut u32).write_volatile(0x7788_99aa) };
+            assert_eq!(
+                copy.update(p, PAGE),
+                KERNEL_PAGE,
+                "only the title-modified 4 KiB subpage is copied"
+            );
+            assert_eq!(
+                copy.read_host((p + 3 * KERNEL_PAGE + 4) as u64, 1),
+                [0x7788_99aa]
+            );
+        });
+        drop(copy);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn unchanged_4k_subpages_are_skipped_on_whole_page_refresh() {
+        assert!(decide_compare_4k(None, false));
+        assert!(!decide_compare_4k(None, true));
+        assert!(!decide_compare_4k(Some("0"), false));
+        assert!(decide_compare_4k(Some("1"), true));
+        if host().is_none() {
+            return;
+        }
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return;
+        };
+        crate::watch::tests::with_page_parts(false, || {
+            with_compare_4k(true, || {
+                // Initial refresh seeds all 16 x 4 KiB subpages.
+                assert_eq!(copy.update(p, PAGE), PAGE);
+
+                // Modify only 2 of the 16 subpages inside the 64 KiB page.
+                // SAFETY: inside `p..p + PAGE`.
+                unsafe {
+                    ((p + 2 * KERNEL_PAGE + 12) as *mut u32).write_volatile(0x1122_3344);
+                    ((p + 11 * KERNEL_PAGE + 28) as *mut u32).write_volatile(0x5566_7788);
+                }
+                assert_eq!(
+                    copy.update(p, PAGE),
+                    2 * KERNEL_PAGE,
+                    "userspace 4 KiB compare skips the 14 unchanged subpages even with page_parts=false"
+                );
+                assert_eq!(
+                    copy.read_host((p + 2 * KERNEL_PAGE + 12) as u64, 1),
+                    [0x1122_3344]
+                );
+                assert_eq!(
+                    copy.read_host((p + 11 * KERNEL_PAGE + 28) as u64, 1),
+                    [0x5566_7788]
+                );
+            });
+        });
+        drop(copy);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn large_runs_bypass_4k_chunked_compare_and_copy_whole() {
+        if host().is_none() {
+            return;
+        }
+        let pages = (COMPARE_4K_MAX_BYTES / PAGE) + 1;
+        let len = pages * PAGE;
+        let p = crate::watch::tests::pool(pages);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return;
+        };
+        crate::watch::tests::with_page_parts(false, || {
+            with_compare_4k(true, || {
+                // Initial refresh seeds the entire large buffer in one whole copy.
+                assert_eq!(copy.update(p, len), len);
+
+                // Dirty all pages, modifying a single word: range exceeds
+                // `COMPARE_4K_MAX_BYTES`, so it copies whole without 64 KiB chunking.
+                crate::watch::retake(p, len);
+                // SAFETY: inside `p..p + len`.
+                unsafe { ((p + len - 16) as *mut u32).write_volatile(0xaabb_ccdd) };
+                assert_eq!(copy.update(p, len), len);
+                assert_eq!(
+                    copy.read_host((p + len - 16) as u64, 1),
+                    [0xaabb_ccdd]
+                );
+            });
+        });
+        drop(copy);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 }

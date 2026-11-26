@@ -107,6 +107,12 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// GPU shader copy-back bytes written through pinned section views vs
+    /// fallback title addresses, and write-watch echo bytes skipped vs modified.
+    OwnBackBytes,
+    OwnBackMissBytes,
+    EchoSkippedBytes,
+    EchoChangedBytes,
     /// Our heap blocks of [`BIG`] bytes or more made, freed and resized
     /// (blocks, bytes and nanoseconds in the system allocator).
     BigMade,
@@ -299,6 +305,20 @@ pub(crate) fn log(frames: f64) {
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    if c[C::OwnBackBytes as usize] + c[C::OwnBackMissBytes as usize] > 0.0 {
+        tracing::info!(
+            "GPU copy-back MB/frame: {:.3} through section views, {:.3} through title addresses",
+            mb(c[C::OwnBackBytes as usize]),
+            mb(c[C::OwnBackMissBytes as usize]),
+        );
+    }
+    if c[C::EchoSkippedBytes as usize] + c[C::EchoChangedBytes as usize] > 0.0 {
+        tracing::info!(
+            "GPU copy-back echo MB/frame: {:.3} unchanged and skipped, {:.3} modified by title",
+            mb(c[C::EchoSkippedBytes as usize]),
+            mb(c[C::EchoChangedBytes as usize]),
+        );
+    }
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB ({:.0} into memory \
          shown twice); {:.0} refreshes {:.1} MB, \

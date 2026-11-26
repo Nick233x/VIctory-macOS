@@ -98,8 +98,9 @@ pub use alias::{PhysicalHeap, physical_heap};
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
-    title_memory_remapped, writing as kernel_will_write,
+    Writing as KernelWrite, fault_tracking, note_page_guard, rosetta, stores_need_patching,
+    title_memory_aliased, title_memory_mapped, title_memory_remapped, use_copy_back_view,
+    writing as kernel_will_write,
 };
 
 /// A whole file, read without asking for its size or other metadata.
