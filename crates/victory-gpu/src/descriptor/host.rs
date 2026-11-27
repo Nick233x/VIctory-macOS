@@ -21,6 +21,9 @@ use crate::backend::{HostGpu, HostMemory};
 use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
+/// The widest span of stale slots a heap sync's batch reads in one call
+/// (`mirror_synced_batch`); its callers pass a page's slots (64 KiB).
+const SPAN_READ_MAX: u64 = 1 << 20;
 
 thread_local! {
     /// True while this thread is inside [`HostHeap::publish`], preventing
@@ -1789,6 +1792,20 @@ impl HostHeap {
                 .map(|&(_, data, _)| data);
             let addr_slots = self.address_slots();
 
+            // The live records of every stale slot, read once under
+            // `self.made` (one `ReadProcessMemory` for the span, a page's at
+            // most): read a slot at a time it was a call per slot, ~0.5 us
+            // each under Wine, most of the batch's time for ~39,000 slots.
+            // A span that cannot be read whole is read a slot at a time.
+            let span = stale
+                .iter()
+                .map(|&(i, _)| at(i))
+                .fold((u64::MAX, 0u64), |(lo, hi), a| (lo.min(a), hi.max(a + 12)));
+            let mut live_span: Vec<u8> = Vec::new();
+            let span_read = !stale.is_empty() && span.1 - span.0 <= SPAN_READ_MAX && {
+                live_span.resize((span.1 - span.0) as usize, 0);
+                crate::host::read_into(span.0 as *const u8, &mut live_span)
+            };
             for (entry_idx, &(index, snapshot)) in stale.iter().enumerate() {
                 let addr = at(index);
                 // Re-read live title memory under `self.made`: if a title
@@ -1796,7 +1813,10 @@ impl HostHeap {
                 // during `prepare`), defer to `mirror` after dropping locks.
                 // SAFETY: the caller holds the heap alive until the sync completes.
                 let mut raw = [0u8; 12];
-                if !crate::host::read_into(addr as *const u8, &mut raw) {
+                if span_read {
+                    let off = (addr - span.0) as usize;
+                    raw.copy_from_slice(&live_span[off..off + 12]);
+                } else if !crate::host::read_into(addr as *const u8, &mut raw) {
                     continue;
                 }
                 let live = [
