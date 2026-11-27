@@ -7866,6 +7866,10 @@ mod marks {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
+        // Synchronous and without prep-ahead, not while another test runs
+        // them: with VICTORY_PREP_AHEAD even submissions are marked by the
+        // second mark list, not by `host.mark()`.
+        let _mode = super::flight::ModeGuard::new(false, false);
         let mark = host.mark().expect("the mark list");
         let list = host.new_list().unwrap();
         list.close();
