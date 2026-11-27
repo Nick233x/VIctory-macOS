@@ -198,6 +198,14 @@ pub(crate) fn wait_for_test(this: This, fence: This, value: u64) -> HRESULT {
     wait(this, fence, value)
 }
 
+/// `CopyPageMappingsBatchX` with one batch of one range.
+#[cfg(all(windows, test))]
+pub(crate) fn map_pages_for_test(this: This, destination: u64, kind: u32, start: u32, count: u32) -> HRESULT {
+    let range = PageRange { kind, start, count };
+    let batch = PageBatch { destination, count: 1, ranges: &raw const range };
+    copy_page_mappings(this, 1, &batch, 0, 0, 0)
+}
+
 /// What ran held work: the title's submission, a queue's Signal or Wait, a
 /// CPU fence call, PresentX, host work of ours that runs synchronously
 /// behind the queued work (`VICTORY_ASYNC_SUBMIT=1` or `VICTORY_FLIGHT1=1`:
@@ -386,6 +394,13 @@ fn pump_ready_under_drain(why: Why) -> bool {
         };
         moved_any = true;
         match ready {
+            Ready::Action(act) => {
+                // The queue's work before it is on the host GPU: land it
+                // (as the next preparation would), so its copy-back reaches
+                // memory as it was mapped, then act.
+                host.finish_flight_now();
+                act();
+            }
             Ready::Signal { fence, value } => {
                 if !crate::host::flight1_enabled()
                     || !host.attach_signal(fence as This, value, true)
@@ -491,12 +506,81 @@ pub(crate) fn drain_submit(why: Why) {
 /// `composite`, `capture`) before touching the GPU so they execute strictly
 /// after any queued async-submit work or in-flight Flight-1 submission.
 #[cfg(windows)]
+#[track_caller]
 pub(crate) fn before_sync() {
     if (crate::host::async_submit_enabled() || crate::host::flight1_enabled())
         && !ON_SUBMIT_THREAD.with(std::cell::Cell::get)
     {
+        let caller = std::panic::Location::caller();
+        let started = std::time::Instant::now();
         drain_submit(Why::Sync);
+        note_sync(caller, started.elapsed());
     }
+}
+
+/// What drained the queued work (`VICTORY_ASYNC_SUBMIT=1` or
+/// `VICTORY_FLIGHT1=1`), for the frame report ([`log_drains`]).
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum Drain {
+    /// PresentX waited for all queued work.
+    Present,
+    /// A page mapping batch was done at once: its queue held nothing and no
+    /// host submission was in flight.
+    MappingAtOnce,
+    /// A page mapping batch was queued behind its queue's work.
+    MappingQueued,
+}
+
+#[cfg(windows)]
+static DRAINS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+#[cfg(windows)]
+fn note_drain(d: Drain) {
+    DRAINS[d as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Our synchronous host work that drained queued work since the last
+/// report: where it was called from, how often, and microseconds waited.
+#[cfg(windows)]
+static SYNCS: std::sync::Mutex<Vec<(&'static std::panic::Location<'static>, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn note_sync(at: &'static std::panic::Location<'static>, waited: std::time::Duration) {
+    let mut syncs = SYNCS.lock().unwrap_or_else(|e| e.into_inner());
+    let us = waited.as_micros() as u64;
+    match syncs.iter_mut().find(|(l, ..)| *l == at) {
+        Some((_, n, t)) => (*n, *t) = (*n + 1, *t + us),
+        None => syncs.push((at, 1, us)),
+    }
+}
+
+/// The frame report's line of what drained the queued work, per frame over
+/// `frames`: nothing unless something did.
+#[cfg(windows)]
+pub(crate) fn log_drains(frames: f64) {
+    let [present, at_once, queued] = DRAINS.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    let mut syncs = std::mem::take(&mut *SYNCS.lock().unwrap_or_else(|e| e.into_inner()));
+    if present + at_once + queued == 0 && syncs.is_empty() {
+        return;
+    }
+    syncs.sort_by_key(|&(_, _, us)| std::cmp::Reverse(us));
+    let per = |n: u64| n as f64 / frames;
+    let sites: Vec<String> = syncs
+        .iter()
+        .take(6)
+        .map(|(l, n, us)| format!("{}:{} {:.1}x {:.1} ms", l.file(), l.line(), per(*n), *us as f64 / 1e3 / frames))
+        .collect();
+    tracing::info!(
+        "queued host work drained per frame: by presents {:.1}; page mappings done at once {:.1}, queued \
+         behind their queue {:.1}; by our own host work {:.1} ({})",
+        per(present),
+        per(at_once),
+        per(queued),
+        per(syncs.iter().map(|s| s.1).sum()),
+        if sites.is_empty() { "none".into() } else { sites.join(", ") }
+    );
 }
 
 /// Called by `victory-flight` (and `Quiet::drop`) strictly AFTER releasing
@@ -1159,6 +1243,7 @@ extern "system" fn present(
     // shows the frame as far as it ran); the frame line names such work.
     #[cfg(windows)]
     if crate::host::async_submit_enabled() || crate::host::flight1_enabled() {
+        note_drain(Drain::Present);
         drain_submit(Why::Present);
     } else {
         pump_held(Why::Present);
@@ -1297,6 +1382,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
 /// and how many.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct PageRange {
     kind: u32,
     start: u32,
@@ -1318,10 +1404,18 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once.
+/// one constant page or of unmapped pages).
 ///
-/// shortcut: done ahead of work the queue still holds (counted in the frame
-/// line); queue it as an item like Signal if that count is not 0.
+/// On the console the batch is a queue operation, in the queue's order.
+/// With `VICTORY_ASYNC_SUBMIT=1` or `VICTORY_FLIGHT1=1` it is: while the
+/// queue holds work or a host submission is in flight, the batch is queued
+/// as an [`Item::Action`] (the submit worker lands the flight, maps, then
+/// prepares the queue's later work) and the title's thread goes on; else it
+/// is done at once. (It drained all queued work before: 124-182 ms of a
+/// 428 ms frame on the title's thread.)
+///
+/// shortcut: otherwise done at once, ahead of work the queue still holds
+/// (counted in the frame line).
 extern "system" fn copy_page_mappings(
     this: This,
     count: u32,
@@ -1336,29 +1430,67 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    // The batches as the title passed them: it may reuse them once we return.
+    let batches: Vec<(u64, Vec<PageRange>)> = if count == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the title passes `count` batches.
+        unsafe { std::slice::from_raw_parts(batches, count as usize) }
+            .iter()
+            .filter(|b| !b.ranges.is_null())
+            .map(|b| {
+                // SAFETY: each batch holds `count` ranges.
+                let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+                (b.destination, ranges.to_vec())
+            })
+            .collect()
+    };
     #[cfg(windows)]
     {
-        if crate::host::async_submit_enabled() || crate::host::flight1_enabled() {
-            drain_submit(Why::Sync);
+        let queued = crate::host::async_submit_enabled() || crate::host::flight1_enabled();
+        let mut held = if queued { held_for(Why::Sync) } else { held() };
+        if queued
+            && (held.holds_work(this as usize)
+                || crate::host::host().is_some_and(crate::host::Host::has_in_flight))
+        {
+            held.push(
+                this as usize,
+                Item::Action(Box::new(move || map_pages(map, &batches, pool, pool_pages))),
+            );
+            drop(held);
+            note_drain(Drain::MappingQueued);
+            if crate::host::async_submit_enabled() {
+                ensure_submit_worker();
+                wake_submit();
+            } else {
+                pump_unlocked(Why::Sync);
+            }
+            return S_OK;
         }
-        if held().holds_work(this as usize) {
+        if held.holds_work(this as usize) {
             account().mappings += 1;
+        }
+        drop(held);
+        if queued {
+            note_drain(Drain::MappingAtOnce);
         }
     }
     #[cfg(not(windows))]
     let _ = this;
-    let batches = (count > 0).then(|| {
-        // SAFETY: the title passes `count` batches.
-        unsafe { std::slice::from_raw_parts(batches, count as usize) }
-    });
+    map_pages(map, &batches, pool, pool_pages);
+    S_OK
+}
+
+/// Maps `batches` of `pool` (`pool_pages` pages) with `map`.
+fn map_pages(
+    map: crate::resource::PageMapper,
+    batches: &[(u64, Vec<PageRange>)],
+    pool: u64,
+    pool_pages: u32,
+) {
     let mut ok = true;
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let mut at = b.destination;
+    for (destination, ranges) in batches {
+        let mut at = *destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
@@ -1379,7 +1511,6 @@ extern "system" fn copy_page_mappings(
             tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
         });
     }
-    S_OK
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {

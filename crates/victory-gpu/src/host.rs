@@ -2066,6 +2066,7 @@ impl HostGpu for Host {
     }
 
     /// Runs closed lists and waits for them.
+    #[track_caller]
     fn execute(&self, runs: &[&HostList]) {
         self.execute_with_barriers(runs, &[]);
     }
@@ -2076,6 +2077,7 @@ impl Host {
     /// command list before each `runs[i]` where `barrier_before.get(i) == Some(&true)`.
     /// Drains any queued async-submit work and any active Flight-1 submission
     /// first so synchronous callers observe strictly ordered GPU state.
+    #[track_caller]
     pub(crate) fn execute_with_barriers(&self, runs: &[&HostList], barrier_before: &[bool]) {
         if !HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
             crate::queue::before_sync();
@@ -5652,6 +5654,7 @@ impl Meter {
             // With VICTORY_ASYNC_SUBMIT=1 / VICTORY_FLIGHT1=1: what the
             // submit worker did instead, and how long the host GPU waited.
             flight::log_frame(report_frames);
+            crate::queue::log_drains(report_frames);
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {

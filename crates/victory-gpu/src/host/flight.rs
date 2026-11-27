@@ -1142,6 +1142,56 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// The fence [`recording_mapper`] reads, and what it saw: each mapping's
+    /// destination and the fence's value then.
+    static MAPPING_FENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static MAPPED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    fn recording_mapper(to: u64, _from: u64, _len: u64) -> bool {
+        let fence = MAPPING_FENCE.load(Ordering::Acquire) as This;
+        MAPPED.lock().unwrap().push((to, crate::fence::value(fence)));
+        true
+    }
+
+    /// Under `VICTORY_ASYNC_SUBMIT=1` a page mapping batch behind work its
+    /// queue holds does not wait for it: the title's call returns at once,
+    /// and the batch is mapped once the work before it ran (its fence, 1,
+    /// moved) and before the work after it (fence 2) did.
+    #[test]
+    fn async_submit_queues_page_mappings_in_their_queues_order() {
+        let Some(_) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::new(true, true);
+        const GREATER_EQUAL: u32 = 7;
+        const UNMAPPED: u32 = 2;
+        // No other test of this crate sets a mapper.
+        crate::resource::use_page_mapper(recording_mapper);
+
+        let (q, f) = make_queue_and_fence();
+        MAPPING_FENCE.store(f as usize, Ordering::Release);
+        MAPPED.lock().unwrap().clear();
+        let (_alloc_a, la) = make_title_list();
+        let (_alloc_b, lb) = make_title_list();
+        let flag = Box::new(std::sync::atomic::AtomicU64::new(0));
+        let flag_addr = std::ptr::from_ref(&*flag) as u64;
+
+        crate::list::wait64(la, flag_addr, GREATER_EQUAL, 1, 0);
+        close_title_list(la);
+        queue_execute(q, &[la]);
+        queue_signal(q, f, 1);
+        let destination = 0x7_1234_0000;
+        assert_eq!(crate::queue::map_pages_for_test(q, destination, UNMAPPED, 0, 1), S_OK);
+        assert!(MAPPED.lock().unwrap().is_empty(), "mapped ahead of the work its queue holds");
+        close_title_list(lb);
+        queue_execute(q, &[lb]);
+        queue_signal(q, f, 2);
+
+        flag.store(1, Ordering::Release);
+        assert!(wait_fence(f, 2, Duration::from_secs(5)), "the queue's work did not run");
+        assert_eq!(*MAPPED.lock().unwrap(), [(destination, 1)]);
+    }
+
     /// Under `VICTORY_ASYNC_SUBMIT=1` + `VICTORY_FLIGHT1=1`, submits
     /// multiple lists with immediate title `Reset` (exercising `list::restart`
     /// early-reset splitting), interleaved `Signal`s, and `drain_submit`
