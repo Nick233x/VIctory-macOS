@@ -488,6 +488,35 @@ fn sync_fast_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FAST").as_deref() != Some(std::ffi::OsStr::new("0")))
 }
 
+/// Whether heap syncs leave a made slot as it is when the title wrote bytes
+/// there that are no record of ours (zeros, or its own data between its
+/// descriptors): `VICTORY_STALE_LEFT=1`. Most slots a sync made were such
+/// in a title's world (32,000 of 47,000 a frame in 64bitMango's fork, where
+/// leaving them took heap syncs from 35.4 to 23.4 ms a frame), and no draw
+/// read one through a table. Left, the slot keeps the view it had: a draw
+/// that reads it through a table makes it null then ([`HostHeap::mirror`]
+/// finds no record of ours), a title thread writing a view there makes it,
+/// and the title writing back the record it was made from costs nothing. A
+/// record of ours that names no view (of a released resource) is still
+/// made null.
+/// shortcut: a shader that takes such a slot from the heap at an index from
+/// its data reads the view the slot had, not nothing; and what the slot
+/// views stays entered (`crate::bindless`), so its memory is kept current
+/// until the slot is written again.
+fn stale_left() -> bool {
+    // Tests choose for themselves, so the tests of making such slots null
+    // still run whatever the default.
+    #[cfg(test)]
+    {
+        tests::STALE_LEFT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_STALE_LEFT"))
+    }
+}
+
 /// Monotonic identity for each [`HostHeap`] so stale dynamic-slot releases
 /// targeting a released heap's recycled address never free a newer heap's slots.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -1480,6 +1509,7 @@ impl HostHeap {
         let buf_end = buf_start.saturating_add(buf.len() as u64);
         let mut legacy_verify = false;
 
+        let left = stale_left();
         if fast {
             let mut stale: Vec<(u32, [u32; 3])> = Vec::new();
             let all_in_buf =
@@ -1508,7 +1538,9 @@ impl HostHeap {
                             ptr = ptr.wrapping_add(step_usize);
                             let [tag, view, generation] = record;
                             if tag != VIEW_TAG || generation == 0 {
-                                if (nonzero_word >> (i & 63)) & 1 != 0 {
+                                if (nonzero_word >> (i & 63)) & 1 != 0
+                                    && !(left && tag != VIEW_TAG)
+                                {
                                     stale.push((i, record));
                                 }
                                 i += 1;
@@ -1558,7 +1590,9 @@ impl HostHeap {
                                 };
                             let [tag, view, generation] = record;
                             if tag != VIEW_TAG || generation == 0 {
-                                if (nonzero_word >> (i & 63)) & 1 != 0 {
+                                if (nonzero_word >> (i & 63)) & 1 != 0
+                                    && !(left && tag != VIEW_TAG)
+                                {
                                     stale.push((i, record));
                                 }
                                 i += 1;
@@ -1618,7 +1652,7 @@ impl HostHeap {
                 };
                 let [tag, view, generation] = record;
                 if tag != VIEW_TAG {
-                    if !legacy_fast || self.made_is_nonzero(i) {
+                    if !left && (!legacy_fast || self.made_is_nonzero(i)) {
                         stale.push(i);
                     }
                     continue;
@@ -3610,6 +3644,71 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Set in a test: heap syncs of its thread leave slots of foreign
+        /// bytes as they are, as with `VICTORY_STALE_LEFT=1`.
+        pub(crate) static STALE_LEFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// With `VICTORY_STALE_LEFT=1` a heap sync leaves a made slot the title
+    /// wrote zeros or other bytes of its own to, and the record written back
+    /// costs nothing; a draw reading the slot makes it null, and a record of
+    /// ours naming no view is still made null by the sync. Off, the sync
+    /// makes the slot null. Both the fast and the legacy sync.
+    #[test]
+    fn syncs_leave_slots_the_title_wrote_foreign_bytes_to() {
+        const SLOTS: u32 = 2_048;
+        let srv_desc = [62u32, 1, 0x1688, 0, 0, 0, 256, 0, 0, 0];
+        let buffer = crate::resource::test_buffer(256);
+        let (ptr, len) = crate::resource::buffer_bytes(buffer).expect("buffer bytes");
+        crate::shadow::register(buffer as usize, ptr as u64, len);
+        let mut record = [0u32; 3];
+        let at = record.as_mut_ptr() as u64;
+        crate::descriptor::create_srv(std::ptr::null(), buffer, &srv_desc, at);
+        let write = |mem: &mut [u8], slot: usize, words: [u32; 3]| {
+            for (k, w) in words.iter().enumerate() {
+                mem[slot * 32 + 4 * k..slot * 32 + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        };
+        for fast in [false, true] {
+            let Some(host) = HostHeap::new(false, SLOTS) else {
+                break; // no host GPU here
+            };
+            let mut mem = vec![0u8; SLOTS as usize * 32];
+            for slot in 0..4 {
+                write(&mut mem, slot, record);
+            }
+            let sync = |mem: &[u8]| {
+                let start = mem.as_ptr() as u64;
+                host.sync_slots_bytes_with(0..SLOTS, start, 32, start, mem, fast);
+            };
+            sync(&mem);
+            assert!((0..4).all(|i| host.made(i)), "fast {fast}: made from the records");
+            STALE_LEFT.with(|left| left.set(true));
+            write(&mut mem, 0, [0, 0, 0]);
+            write(&mut mem, 1, [0xdead_beef, 0x1234_5678, 7]);
+            write(&mut mem, 2, [VIEW_TAG, 0, 0]);
+            sync(&mem);
+            assert!(host.made(0), "fast {fast}: zeros are left");
+            assert!(host.made(1), "fast {fast}: other bytes are left");
+            assert!(!host.made(2), "fast {fast}: a record of ours naming no view is made null");
+            assert!(host.made(3), "fast {fast}: an unchanged record stays");
+            // The record written back: the slot is still made from it.
+            write(&mut mem, 0, record);
+            sync(&mem);
+            assert!(host.made(0), "fast {fast}: written back");
+            // A draw reading a left slot makes it null.
+            let handle = mem.as_ptr() as u64 + 32;
+            assert!(host.mirror(1, handle, true).is_none());
+            assert!(!host.made(1), "fast {fast}: a draw makes the left slot null");
+            STALE_LEFT.with(|left| left.set(false));
+            write(&mut mem, 3, [0, 0, 0]);
+            sync(&mem);
+            assert!(!host.made(3), "fast {fast}: off, zeros are made null");
+        }
+        crate::object::release(buffer);
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
