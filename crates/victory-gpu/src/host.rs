@@ -1601,8 +1601,10 @@ pub(crate) struct HostList {
     marked: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
-    /// The pipelines the list binds, for reports of slow submissions.
-    pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The pipelines the list binds, for reports of slow submissions: shared
+    /// with the hang note ([`WAITING_ON`]), which names them only if the
+    /// GPU hangs, so a submission takes the sets, not copies of the names.
+    pipelines: Mutex<Pipelines>,
     /// Which list this is, for the name that tells it apart in device-removed
     /// data (see [`HostList::is_node`]).
     id: u64,
@@ -2653,18 +2655,15 @@ impl Host {
             });
         }
         // What a hang would be waiting on (`Host::wait_for` names it after 8 s).
-        *WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()) = {
-            let pipelines: std::collections::BTreeSet<String> = runs
-                .iter()
-                .flat_map(|l| {
-                    l.pipelines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-                .collect();
-            format!("{} lists, pipelines {pipelines:?}", runs.len())
-        };
+        {
+            let mut waiting = WAITING_ON.lock().unwrap_or_else(|e| e.into_inner());
+            waiting.0 = runs.len();
+            waiting.1.clear();
+            waiting.1.extend(
+                runs.iter()
+                    .map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            );
+        }
         drop(run_refs);
         #[cfg(not(feature = "diagnostics"))]
         let _ = firsts;
@@ -2706,15 +2705,10 @@ impl Host {
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
-                .iter()
-                .flat_map(|l| {
-                    l.pipelines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-                .collect();
+            let pipelines = pipeline_names(
+                runs.iter()
+                    .map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            );
             tracing::warn!(
                 ms = gpu.as_millis(),
                 lists = runs.len(),
@@ -2960,7 +2954,11 @@ impl Host {
                 }
                 if !logged_hang && seconds >= 8 {
                     logged_hang = true;
-                    let what = WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let what = {
+                        let waiting = WAITING_ON.lock().unwrap_or_else(|e| e.into_inner());
+                        let pipelines = pipeline_names(waiting.1.iter().cloned());
+                        format!("{} lists, pipelines {pipelines:?}", waiting.0)
+                    };
                     tracing::error!(%what, value, "host GPU hang: the submission waited on");
                 }
             }
@@ -3465,7 +3463,10 @@ impl HostList {
         self.widened_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            // The hang note may still hold the set: a new one, not a copy.
+            reset_pipelines(&mut self.pipelines.lock().unwrap_or_else(|e| e.into_inner()));
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -4057,7 +4058,9 @@ impl HostList {
     fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+            // Held by the hang note only between a submission and the
+            // list's reset, which gives the list a set of its own.
+            std::sync::Arc::make_mut(&mut pipelines).insert(name.to_owned());
         }
     }
 
@@ -8063,6 +8066,97 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
     }
 }
 
-/// The pipelines of the lists the last submission ran, for a hang's log line
-/// (`Host::wait_for`): which work the GPU never finished.
-static WAITING_ON: Mutex<String> = Mutex::new(String::new());
+/// The pipelines a list binds ([`HostList::pipelines`]).
+type Pipelines = std::sync::Arc<std::collections::BTreeSet<String>>;
+
+/// The lists the last submission ran (how many, and their pipelines), for a
+/// hang's log line (`Host::wait_for`): which work the GPU never finished.
+/// Naming them is left to that line: building the names for every
+/// submission cost 0.2 ms each under Wine at 100 pipelines a list, 0.6 ms
+/// at 300 (benchmark `waiting_on_takes_the_sets`).
+static WAITING_ON: Mutex<(usize, Vec<Pipelines>)> = Mutex::new((0, Vec::new()));
+
+/// Empties a list's pipelines at its reset, leaving a set the hang note
+/// still holds as it is.
+fn reset_pipelines(pipelines: &mut Pipelines) {
+    match std::sync::Arc::get_mut(pipelines) {
+        Some(set) => set.clear(),
+        None => *pipelines = Pipelines::default(),
+    }
+}
+
+/// Every pipeline name of `sets`, once each and in order.
+fn pipeline_names(sets: impl Iterator<Item = Pipelines>) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for set in sets {
+        names.extend(set.iter().cloned());
+    }
+    names
+}
+
+#[cfg(test)]
+mod waiting_on_tests {
+    use super::{Pipelines, pipeline_names, reset_pipelines};
+    use std::sync::Arc;
+
+    fn sets(lists: usize, per: usize) -> Vec<Pipelines> {
+        (0..lists)
+            .map(|l| {
+                Arc::new(
+                    (0..per)
+                        .map(|p| format!("vs_{:016x}_ps_{:016x}", p * 7 + l, p))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reset_leaves_the_hang_notes_set_whole() {
+        let mut list: Pipelines = Arc::new(["a".to_owned(), "b".to_owned()].into());
+        let noted = list.clone();
+        reset_pipelines(&mut list);
+        assert!(list.is_empty());
+        assert_eq!(noted.len(), 2, "the note keeps what the submission ran");
+        // Unshared, the list's own set is emptied in place.
+        let before = Arc::as_ptr(&list);
+        Arc::make_mut(&mut list).insert("c".to_owned());
+        reset_pipelines(&mut list);
+        assert!(list.is_empty());
+        assert_eq!(Arc::as_ptr(&list), before);
+        assert_eq!(
+            pipeline_names([noted, Arc::new(["b".to_owned(), "z".to_owned()].into())].into_iter())
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["a", "b", "z"]
+        );
+    }
+
+    /// What noting a submission costs: copying every name (as before) against
+    /// taking the sets. `cargo test --release -p victory-gpu --lib
+    /// waiting_on_takes_the_sets -- --ignored --nocapture`
+    #[test]
+    #[ignore = "times the hang note of a submission"]
+    fn waiting_on_takes_the_sets() {
+        for per in [20, 100, 300] {
+            let lists = sets(10, per);
+            let rounds = 2000;
+            let started = std::time::Instant::now();
+            let mut total = 0;
+            for _ in 0..rounds {
+                let names = pipeline_names(lists.iter().cloned());
+                total += format!("{} lists, pipelines {names:?}", lists.len()).len();
+            }
+            let copied = started.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+            let mut held: Vec<Pipelines> = Vec::new();
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                held.clear();
+                held.extend(lists.iter().cloned());
+                total += held.len();
+            }
+            let taken = started.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+            println!("{per} pipelines a list: names {copied:.1} us, sets {taken:.2} us ({total})");
+        }
+    }
+}
