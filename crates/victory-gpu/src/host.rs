@@ -5963,7 +5963,16 @@ impl Host {
                 ),
             ]);
             p.copy.close();
-            self.execute(&[&p.copy]);
+            // With work queued for the submit worker, PresentX drained it just
+            // before (`queue::present`): the copy goes behind the host
+            // submission in flight only, ahead of what other threads queued
+            // since (the next frame's, as on the console), rather than
+            // draining again behind all of it.
+            if async_submit_enabled() || flight1_enabled() {
+                self.execute_sync(&[&p.copy], &[]);
+            } else {
+                self.execute(&[&p.copy]);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
