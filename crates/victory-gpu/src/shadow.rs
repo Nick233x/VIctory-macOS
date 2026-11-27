@@ -2725,10 +2725,15 @@ pub(crate) fn log_refreshed(frames: f64) {
         .iter()
         .take(5)
         .map(|&(start, len, t, bytes, us)| {
+            // Memory shown at several addresses: physical pages the title
+            // maps more than once (`XMemMapPhysicalPages`), which zero-copy
+            // aliasing does not reach (it remaps `XMemVirtualAlloc` commits).
+            let shown = crate::watch::aliased(start as usize, len as usize);
             format!(
-                "{start:#x}+{:.1} MB{} {:.1} MB {:.1} ms",
+                "{start:#x}+{:.1} MB{}{} {:.1} MB {:.1} ms",
                 len as f64 / 1e6,
                 if t { "" } else { " (untracked)" },
+                if shown { " (shown at several addresses)" } else { "" },
                 mb(bytes),
                 us as f64 / 1e3 / frames
             )

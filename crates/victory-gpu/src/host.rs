@@ -7237,8 +7237,19 @@ mod batch {
     /// current and nothing is refreshed again; with `probe` it still runs.
     #[test]
     fn a_title_copy_of_bytes_in_place_is_left_out() {
-        let Some((p, a)) = plain(2) else {
-            return; // no host GPU here
+        // Memory another test gave back may still show elsewhere or have a
+        // second copy registered: then nothing is compared (as it should
+        // not be). Such memory is kept, and other memory taken.
+        let mut kept = Vec::new();
+        let (p, a) = loop {
+            let Some((p, a)) = plain(2) else {
+                return; // no host GPU here
+            };
+            if !crate::watch::aliased(p, 2 * PAGE) && crate::shadow::over(p, p + 2 * PAGE).len() == 1 {
+                break (p, a);
+            }
+            assert!(kept.len() < 8, "no plain memory without other copies");
+            kept.push(a);
         };
         fill(p, 2 * PAGE, 0x5a);
         let mut batch = Batch::default();

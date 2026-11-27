@@ -254,6 +254,32 @@ fn fast_heap_sync_value(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
 }
 
+/// `VICTORY_HEAP_READ_ONCE=1` (off by default): a heap sync reads the
+/// records of the slots it makes again once, from the first to the last, in
+/// one read through the kernel, instead of one 12-byte read a slot. The
+/// world makes ~41,000 slots a frame again, and a read costs 0.46 µs under
+/// Wine (`bench_record_reads`): ~19 ms a frame. The same bytes, read under
+/// the same lock, a little earlier: a title write after it is seen as
+/// before, by the next sync.
+fn heap_read_once() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_READ_ONCE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_READ_ONCE"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`heap_read_once`] on this test's thread.
+    static TEST_READ_ONCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The most bytes [`heap_read_once`] reads at once (a sync's slots are in
+/// one 64 KiB page; a direct caller may pass more).
+const READ_ONCE_MAX: u64 = 1 << 20;
+
 fn fast_heap_sync() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| fast_heap_sync_value(std::env::var_os("VICTORY_FAST_HEAP_SYNC").as_deref()))
@@ -1800,6 +1826,17 @@ impl HostHeap {
                 .and_then(Option::as_ref)
                 .map(|&(_, data, _)| data);
             let addr_slots = self.address_slots();
+            // `VICTORY_HEAP_READ_ONCE=1`: every record, in one read.
+            let (lowest, highest) = stale
+                .iter()
+                .fold((u64::MAX, 0), |(lo, hi), &(i, _)| (lo.min(at(i)), hi.max(at(i) + 12)));
+            let mut once: Vec<u8> = Vec::new();
+            if heap_read_once() && lowest < highest && highest - lowest <= READ_ONCE_MAX {
+                once.resize((highest - lowest) as usize, 0);
+                if !crate::host::read_into(lowest as *const u8, &mut once) {
+                    once.clear();
+                }
+            }
 
             for (entry_idx, &(index, snapshot)) in stale.iter().enumerate() {
                 let addr = at(index);
@@ -1808,7 +1845,10 @@ impl HostHeap {
                 // during `prepare`), defer to `mirror` after dropping locks.
                 // SAFETY: the caller holds the heap alive until the sync completes.
                 let mut raw = [0u8; 12];
-                if !crate::host::read_into(addr as *const u8, &mut raw) {
+                if !once.is_empty() {
+                    let off = (addr - lowest) as usize;
+                    raw.copy_from_slice(&once[off..off + 12]);
+                } else if !crate::host::read_into(addr as *const u8, &mut raw) {
                     continue;
                 }
                 let live = [
@@ -5314,6 +5354,136 @@ mod tests {
         crate::object::release(buf_c);
         let _ = title_heap.as_mut_ptr();
         let _ = tex_mem.as_ptr();
+    }
+
+    /// Slots made again as a ring of descriptor tables does it: every slot
+    /// takes another view each pass. Times a made slot with one read of its
+    /// record each and with `VICTORY_HEAP_READ_ONCE`, and checks both make
+    /// the same views. `cargo test --release -p victory-gpu --lib
+    /// bench_made_again -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "times heap slots made again"]
+    fn bench_made_again_read_once() {
+        const SLOTS: u32 = 16_384;
+        const PAGE_SLOTS: u32 = 2_048;
+        let srv_desc = [62u32, 1, 0x1688, 0, 0, 0, 256, 0, 0, 0];
+        let records: Vec<[u32; 3]> = (0..256)
+            .map(|_| {
+                let b = crate::resource::test_buffer(256);
+                let (ptr, len) = crate::resource::buffer_bytes(b).expect("buffer bytes");
+                crate::shadow::register(b as usize, ptr as u64, len);
+                let mut rec = [0u32; 3];
+                crate::descriptor::create_srv(std::ptr::null(), b, &srv_desc, rec.as_mut_ptr() as u64);
+                rec
+            })
+            .collect();
+        let write = |mem: &mut [u8], pass: usize| {
+            for i in 0..SLOTS as usize {
+                let rec = records[(i * 7 + pass * 13) % records.len()];
+                for (k, w) in rec.iter().enumerate() {
+                    mem[i * 32 + 4 * k..i * 32 + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+        };
+        let mut times = Vec::new();
+        let mut heaps = Vec::new();
+        for once in [false, true] {
+            let Some(host) = HostHeap::new(false, SLOTS) else {
+                return;
+            };
+            let mem = private_memory(SLOTS as usize * 32);
+            let start = mem.as_ptr() as u64;
+            TEST_READ_ONCE.with(|c| c.set(Some(once)));
+            let sync = |mem: &[u8]| {
+                for p in 0..SLOTS / PAGE_SLOTS {
+                    let (first, last) = (p * PAGE_SLOTS, (p + 1) * PAGE_SLOTS);
+                    let (b0, b1) = (first as usize * 32, last as usize * 32);
+                    host.sync_slots_bytes_with(first..last, start, 32, start + b0 as u64, &mem[b0..b1], true);
+                }
+            };
+            write(mem, 0);
+            sync(mem);
+            let passes = 20;
+            let started = std::time::Instant::now();
+            for pass in 1..=passes {
+                write(mem, pass);
+                sync(mem);
+            }
+            times.push(started.elapsed().as_secs_f64() * 1e6 / (passes * SLOTS as usize) as f64);
+            TEST_READ_ONCE.with(|c| c.set(None));
+            heaps.push(host);
+        }
+        for i in 0..SLOTS {
+            assert_eq!(heaps[0].made(i), heaps[1].made(i), "made differs at slot {i}");
+            assert_eq!(heaps[0].kept(i), heaps[1].kept(i), "kept differs at slot {i}");
+        }
+        eprintln!(
+            "a slot made again: {:.2} us with a read each, {:.2} us reading the records once",
+            times[0], times[1]
+        );
+    }
+
+    /// The records of slots made again are the same read once as read one
+    /// by one: a title write before the sync is made, the slots made match.
+    #[test]
+    fn read_once_makes_what_reading_each_record_makes() {
+        const SLOTS: u32 = 2_048;
+        let srv_desc = [62u32, 1, 0x1688, 0, 0, 0, 256, 0, 0, 0];
+        let records: Vec<[u32; 3]> = (0..8)
+            .map(|_| {
+                let b = crate::resource::test_buffer(256);
+                let (ptr, len) = crate::resource::buffer_bytes(b).expect("buffer bytes");
+                crate::shadow::register(b as usize, ptr as u64, len);
+                let mut rec = [0u32; 3];
+                crate::descriptor::create_srv(std::ptr::null(), b, &srv_desc, rec.as_mut_ptr() as u64);
+                rec
+            })
+            .collect();
+        let mut made = Vec::new();
+        for once in [false, true] {
+            let Some(host) = HostHeap::new(false, SLOTS) else {
+                return;
+            };
+            let mem = private_memory(SLOTS as usize * 32);
+            let start = mem.as_ptr() as u64;
+            TEST_READ_ONCE.with(|c| c.set(Some(once)));
+            for pass in 0..3usize {
+                // Every third slot takes another view, the rest keep theirs.
+                for i in (0..SLOTS as usize).filter(|i| pass == 0 || i % 3 == 0) {
+                    let rec = records[(i + pass) % records.len()];
+                    for (k, w) in rec.iter().enumerate() {
+                        mem[i * 32 + 4 * k..i * 32 + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+                    }
+                }
+                host.sync_slots_bytes_with(0..SLOTS, start, 32, start, &mem[..], true);
+            }
+            TEST_READ_ONCE.with(|c| c.set(None));
+            assert!(host.kept(0) && host.kept(3), "views were made");
+            made.push((0..SLOTS).map(|i| (host.made(i), host.kept(i))).collect::<Vec<_>>());
+        }
+        assert_eq!(made[0], made[1]);
+    }
+
+    /// What a 12-byte read through the kernel costs (one a slot made
+    /// again, `mirror_synced_batch`) against reading the page once.
+    #[test]
+    #[ignore = "times kernel reads of heap records"]
+    fn bench_record_reads() {
+        let mem = private_memory(1 << 16);
+        let rounds = 100_000;
+        let mut raw = [0u8; 12];
+        let started = std::time::Instant::now();
+        for i in 0..rounds {
+            assert!(crate::host::read_into(mem[(i % 2048) * 32..].as_ptr(), &mut raw));
+        }
+        let each = started.elapsed().as_secs_f64() * 1e6 / rounds as f64;
+        let mut page = vec![0u8; 1 << 16];
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(crate::host::read_into(mem.as_ptr(), &mut page));
+        }
+        let whole = started.elapsed().as_secs_f64() * 1e6 / 1000.0;
+        eprintln!("12-byte kernel read {each:.2} us; a 64 KiB page {whole:.1} us (2,048 records)");
     }
 
     /// What syncing a heap page the title rewrote with the same records
