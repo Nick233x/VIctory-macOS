@@ -290,6 +290,63 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Of the preparing, by phase ([`Phase`]), in microseconds since the last
+/// frame-rate line: where a submission's CPU time goes, so a frame report
+/// says which part to make faster. Read with [`take_phases`].
+static PREP_PHASES: [std::sync::atomic::AtomicU64; PHASE_NAMES.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; PHASE_NAMES.len()];
+
+/// The phases of [`Host::prepare_submission`], in the order they run.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Host textures given up, unordered views made again.
+    Evicting,
+    /// `descriptor::sync_heaps`: what the title wrote into its heaps.
+    HeapSync,
+    /// Spare lists trimmed, textures and heaps brought up (`bindless::uploads`).
+    Uploads,
+    /// The lists' deferred steps (`HostList::run_deferred`): title copies,
+    /// the refreshes they flush, heap and page-table scans, host work.
+    ListSteps,
+    /// The lists' preludes (state moves, hoisted clamps).
+    Preludes,
+    /// The refreshes still pending once every list's steps ran.
+    Refreshes,
+    /// Waiting for a flight to land first (`VICTORY_PREP_AHEAD=1`).
+    LandingEarly,
+    /// Everything else: barrier lists, bookkeeping, the hang note.
+    Other,
+}
+
+const PHASE_NAMES: [&str; 8] = [
+    "evicting",
+    "heap views synced",
+    "uploads",
+    "list steps",
+    "preludes",
+    "refreshes",
+    "landing early",
+    "other",
+];
+
+/// Adds each phase's time to [`PREP_PHASES`] as the next one starts.
+struct PhaseClock(std::time::Instant);
+
+impl PhaseClock {
+    /// Counts the time since the last lap as `phase`'s.
+    fn lap(&mut self, phase: Phase) {
+        let now = std::time::Instant::now();
+        PREP_PHASES[phase as usize]
+            .fetch_add((now - self.0).as_micros() as u64, Ordering::Relaxed);
+        self.0 = now;
+    }
+}
+
+/// The phases' microseconds since the last call, by [`PHASE_NAMES`].
+fn take_phases() -> [u64; PHASE_NAMES.len()] {
+    PREP_PHASES.each_ref().map(|c| c.swap(0, Ordering::Relaxed))
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -2412,6 +2469,7 @@ impl Host {
         gpu_timing: bool,
     ) -> PreparedSubmission {
         let started = std::time::Instant::now();
+        let mut clock = PhaseClock(started);
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
@@ -2423,15 +2481,20 @@ impl Host {
         // With `VICTORY_PREP_AHEAD=1` a submission still in flight lands
         // first (nothing otherwise): eviction gives up what it may use.
         if crate::resource::evict_due() {
+            clock.lap(Phase::Other);
             flight::land_ahead(flight::Early::Eviction);
+            clock.lap(Phase::LandingEarly);
         }
         crate::resource::evict_unused();
         // The first shader writing through a heap may run in this
         // submission: unordered views left null are made again first.
         if crate::bindless::take_remake() {
+            clock.lap(Phase::Evicting);
             flight::land_ahead(flight::Early::Remake);
+            clock.lap(Phase::LandingEarly);
             crate::descriptor::remake_unordered();
         }
+        clock.lap(Phase::Evicting);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -2439,6 +2502,7 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
+        clock.lap(Phase::HeapSync);
         // Textures heap-indexing shaders may read, and textures read through
         // tables, uploaded first by a list of ours where their title memory
         // changed.
@@ -2470,6 +2534,7 @@ impl Host {
         let uploads = crate::bindless::uploads(&heaps, &textures);
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        clock.lap(Phase::Uploads);
         let uploads_offset = usize::from(uploads.is_some());
         let run_refs: Vec<&HostList> = uploads
             .as_ref()
@@ -2501,7 +2566,9 @@ impl Host {
         let needed_barriers = barrier_before.iter().copied().filter(|&b| b).count();
         // The barrier lists are shared: one submission runs them at a time.
         if needed_barriers > 0 {
+            clock.lap(Phase::Other);
             flight::land_ahead(flight::Early::Barriers);
+            clock.lap(Phase::LandingEarly);
         }
         let mut barrier_pool = (needed_barriers > 0)
             .then(|| self.barrier_lists.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2532,11 +2599,15 @@ impl Host {
         // them: a submission in flight that reads their destinations' host
         // copies lands first (`VICTORY_PREP_AHEAD=1`).
         if runs.iter().any(|r| r.batch_flags().has_title_copy) {
+            clock.lap(Phase::Other);
             flight::land_ahead(flight::Early::TitleCopy);
+            clock.lap(Phase::LandingEarly);
         }
         let mut batch = Batch::take();
+        clock.lap(Phase::Other);
         for (idx, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
+            clock.lap(Phase::ListSteps);
             firsts.push(lists.len());
             let needs_barrier = idx
                 .checked_sub(uploads_offset)
@@ -2558,14 +2629,15 @@ impl Host {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            clock.lap(Phase::Preludes);
         }
         drop(barrier_pool);
         batch.flush();
+        clock.lap(Phase::Refreshes);
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(submitted + 1, runs.len());
         #[cfg(not(feature = "diagnostics"))]
         let _ = submitted;
-        let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::FaultsPrep,
@@ -2596,6 +2668,9 @@ impl Host {
         drop(run_refs);
         #[cfg(not(feature = "diagnostics"))]
         let _ = firsts;
+        // The hang note is part of the preparing, which it used to follow.
+        clock.lap(Phase::Other);
+        let prepared = clock.0;
         PreparedSubmission {
             lists,
             #[cfg(feature = "diagnostics")]
@@ -5998,6 +6073,12 @@ impl Meter {
             // submit worker did instead, and how long the host GPU waited.
             flight::log_frame(report_frames);
             crate::queue::log_drains(report_frames);
+            let phases: Vec<String> = PHASE_NAMES
+                .iter()
+                .zip(take_phases())
+                .map(|(name, us)| format!("{name} {:.1}", ms(us)))
+                .collect();
+            tracing::info!("host preparing per frame by phase, ms: {}", phases.join(", "));
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
