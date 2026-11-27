@@ -792,7 +792,10 @@ impl Views {
         }
     }
 
-    /// Looks up `view`, or inserts it: its `(index, generation)`.
+    /// Looks up `view`, or inserts it: its `(index, generation)`. The
+    /// lock-free mirror of generations ([`set_view_gen`]) is the caller's to
+    /// set: it mirrors [`VIEWS`] only, and a test's own table set there
+    /// named [`VIEWS`]'s low entries stale while another test synced them.
     fn entry_kept(&mut self, view: View) -> (u32, u32) {
         if let Some(&i) = self.index.get(&view) {
             return (i, self.list[i as usize].1);
@@ -808,7 +811,6 @@ impl Views {
             }
         };
         let generation = self.list[i as usize].1;
-        set_view_gen(i, generation);
         self.count_address(&view);
         for r in view.resources().into_iter().filter(|&r| r != 0) {
             self.by_resource.entry(r).or_default().push(i);
@@ -852,6 +854,8 @@ fn record(handle: u64, view: View) {
     }
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let (i, generation) = views.entry_kept(view);
+    // Before the record names it, as the heap syncs check it without the lock.
+    set_view_gen(i, generation);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
