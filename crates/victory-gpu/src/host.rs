@@ -902,10 +902,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// A title heap of 4 view slots with a 4x1 RGBA8 placed texture viewed
+    /// A title heap of 4 view slots with a 12x1 RGBA8 placed texture viewed
     /// at slot 0, made in it; and a way to write a view of another texture
-    /// of `memory` there (`n` 1, 2, ...: its offset), as the title would.
-    fn show_after_heap(memory: &[u8]) -> (&'static crate::descriptor::Heap, impl Fn(u64)) {
+    /// of the same memory there (`n` 1, 2, ...: its offset), as the title
+    /// would. Placed textures are kept by address and description for the
+    /// process (`resource::texture_at`), so the memory is never freed and
+    /// the width is one no other test uses: a texture another test made at
+    /// a reused address would not be new.
+    fn show_after_heap() -> (&'static crate::descriptor::Heap, impl Fn(u64)) {
+        let memory: &'static [u8] = Vec::leak(vec![0u8; 1 << 17]);
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
         let mut heap = null;
@@ -915,7 +920,7 @@ pub(crate) mod tests {
         let base = memory.as_ptr() as u64;
         let start = title_heap.start;
         let write = move |n: u64| {
-            let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+            let words: [u32; 14] = [3, 0, 0, 0, 12, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
             let address = base + n * (1 << 13);
             let mut view = [0u32; 16];
             view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
@@ -936,9 +941,8 @@ pub(crate) mod tests {
     #[test]
     fn show_after_holds_a_slot_of_a_fresh_texture_until_the_next_submission() {
         let Some(host) = host() else { return };
-        let memory = vec![0u8; 1 << 17];
         let scene = ShowAfterScene::new(host, true);
-        let (title_heap, write) = show_after_heap(&memory);
+        let (title_heap, write) = show_after_heap();
         let heap_host = title_heap.host().expect("a host view heap");
         scene.begin();
         write(1);
@@ -955,9 +959,8 @@ pub(crate) mod tests {
     #[test]
     fn show_after_off_makes_a_slot_of_a_fresh_texture_at_once() {
         let Some(host) = host() else { return };
-        let memory = vec![0u8; 1 << 17];
         let scene = ShowAfterScene::new(host, false);
-        let (title_heap, write) = show_after_heap(&memory);
+        let (title_heap, write) = show_after_heap();
         let heap_host = title_heap.host().expect("a host view heap");
         scene.begin();
         write(1);
@@ -971,9 +974,8 @@ pub(crate) mod tests {
     #[test]
     fn show_after_drops_a_held_slot_the_title_wrote_again() {
         let Some(host) = host() else { return };
-        let memory = vec![0u8; 1 << 17];
         let scene = ShowAfterScene::new(host, true);
-        let (title_heap, write) = show_after_heap(&memory);
+        let (title_heap, write) = show_after_heap();
         let heap_host = title_heap.host().expect("a host view heap");
         scene.begin();
         write(1);
