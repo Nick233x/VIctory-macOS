@@ -1516,6 +1516,17 @@ static MARKS: Mutex<Marks> = Mutex::new(Marks {
     owners: BTreeMap::new(),
 });
 
+/// The host copies that own write-mark bits: what shaders writing through
+/// views can reach at all (the `VICTORY_PREP_AHEAD` probe).
+pub(crate) fn mark_owners() -> std::collections::HashSet<usize> {
+    marks()
+        .owners
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+        .map(|s| Arc::as_ptr(&s) as usize)
+        .collect()
+}
+
 fn marks() -> std::sync::MutexGuard<'static, Marks> {
     MARKS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1852,6 +1863,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    for (_, page) in &pages {
+        crate::host::probe_marked(*page, PAGE);
+    }
     // Per copy, in page order, so its pages go back together.
     let mut by_copy: Vec<(Arc<Shadow>, Vec<usize>)> = Vec::new();
     for (copy, page) in pages {

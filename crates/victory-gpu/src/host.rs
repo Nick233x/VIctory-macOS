@@ -5,7 +5,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 mod flight;
-pub(crate) use flight::{async_submit_enabled, flight1_enabled};
+pub(crate) use flight::{async_submit_enabled, flight1_enabled, probe_marked};
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -2725,6 +2725,10 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        flight::probe_landing_starts();
+        for (_, address, len, _) in &back {
+            flight::probe_wrote(*address, *len);
+        }
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -2818,6 +2822,9 @@ impl Host {
             crate::copystat::page_faults().saturating_sub(faults),
         );
         for list in runs {
+            for &(at, _, bytes) in &list.deferred().writes {
+                flight::probe_wrote(at, bytes);
+            }
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -4386,6 +4393,23 @@ impl HostList {
     /// Whether the list's shaders may mark what they write in the view
     /// write bitmaps, which every landing takes
     /// ([`crate::shadow::copy_back_marks`]).
+    /// Why the list is not [`Self::quiet_at_landing`], as [`flight::NotQuiet`]
+    /// bits (the `VICTORY_PREP_AHEAD` probe).
+    pub(crate) fn not_quiet_reasons(&self) -> u8 {
+        use flight::NotQuiet as N;
+        let marks = self.marks_writes();
+        let d = self.deferred();
+        let mut bits = 0;
+        let mut set = |r: N, on: bool| bits |= u8::from(on) << r as u8;
+        set(N::Declared, d.copies.iter().any(|s| matches!(s, Step::GpuWrite(_, _, _, false, _))));
+        set(N::Marks, marks);
+        set(N::After, !d.after.is_empty());
+        set(N::BottomOfPipe, !d.writes.is_empty());
+        set(N::ReadBack, !d.texture_backs.is_empty() || !d.back_wanted.is_empty());
+        set(N::Textures, d.copies.iter().any(|s| matches!(s, Step::Texture(..))));
+        bits
+    }
+
     pub(crate) fn marks_writes(&self) -> bool {
         let unknown = self.clamps.lock().unwrap_or_else(|e| e.into_inner()).hazard.unknown;
         let d = self.deferred();
@@ -4919,6 +4943,7 @@ impl Batch {
             return;
         }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
+        flight::probe_refresh(key, address, len);
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.
         let empty = crate::ranges::Ranges::default();

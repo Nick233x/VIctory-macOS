@@ -326,6 +326,23 @@ pub(crate) fn log_frame(frames: f64) {
     );
     if prep_ahead_enabled() {
         let per = |n: u64| n as f64 / frames;
+        let p = PROBE.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+        let r = &p[Probe::Optimistic as usize + 1..];
+        tracing::info!(
+            "prep-ahead probe per frame: flights not quiet at landing, for declared ranges {:.1}, write marks {:.1}, \
+             work after {:.1}, bottom-of-pipe writes {:.1}, read-backs {:.1}, table textures {:.1}, uploads {:.1}; \
+             preparations right behind one {:.1}: behind one not quiet only for ranges/marks/BoP {:.1}; refreshing \
+             nothing it declared {:.1}, nothing it wrote {:.1}, nothing a view write reaches {:.1}; could go ahead \
+             by ranges {:.1} (if marks were known ahead {:.1})",
+            per(r[0]), per(r[1]), per(r[2]), per(r[3]), per(r[4]), per(r[5]), per(r[6]),
+            per(p[Probe::Behind as usize]),
+            per(p[Probe::RangesOnly as usize]),
+            per(p[Probe::CleanKnown as usize]),
+            per(p[Probe::CleanActual as usize]),
+            per(p[Probe::CleanBound as usize]),
+            per(p[Probe::Ceiling as usize]),
+            per(p[Probe::Optimistic as usize]),
+        );
         tracing::info!(
             "host submissions prepared while the last was in flight per frame: {:.1}, launched while it still \
              was {:.1}; landed it first for: not quiet at landing {:.1}, eviction {:.1}, view remake {:.1}, \
@@ -343,6 +360,166 @@ pub(crate) fn log_frame(frames: f64) {
             per(ahead[9]),
         );
     }
+}
+
+
+/// Why a landed flight was not quiet at landing, as bits of the probe below.
+#[derive(Clone, Copy)]
+pub(crate) enum NotQuiet {
+    /// Ranges its shaders write, declared before it ran.
+    Declared,
+    /// Its shaders mark what they write through views (known only after).
+    Marks,
+    /// Work after it (title memory written at computed addresses).
+    After,
+    /// Bottom-of-pipe writes.
+    BottomOfPipe,
+    /// Texture read-backs.
+    ReadBack,
+    /// Table textures it brought up to date.
+    Textures,
+    /// Heap uploads of its own (their staging is rewound by the next).
+    Uploads,
+}
+
+const NOT_QUIET: usize = NotQuiet::Uploads as usize + 1;
+
+/// The `VICTORY_PREP_AHEAD` probe's counts since the last frame report:
+/// [`Probe`]'s slots, then per [`NotQuiet`] reason the flights that had it.
+static PROBE: [AtomicU64; Probe::Optimistic as usize + 1 + NOT_QUIET] =
+    [const { AtomicU64::new(0) }; Probe::Optimistic as usize + 1 + NOT_QUIET];
+
+/// What the probe counts of preparations right behind a flight that was not
+/// quiet at landing (prepared after it landed, as Wait-Before-Prep does).
+#[derive(Clone, Copy)]
+enum Probe {
+    /// Such preparations.
+    Behind,
+    /// Of them, behind a flight not quiet only for what a range rule can
+    /// check: declared ranges, write marks, bottom-of-pipe writes.
+    RangesOnly,
+    /// Of them, refreshing nothing in the ranges the flight declared or
+    /// wrote at its bottom of pipe (known before it lands).
+    CleanKnown,
+    /// Of them, refreshing nothing in what the flight actually wrote,
+    /// marked pages included (known only once it landed).
+    CleanActual,
+    /// [`Self::CleanKnown`], and, behind a flight marking its writes,
+    /// refreshing no host copy any view writes can reach.
+    CleanBound,
+    /// [`Self::RangesOnly`] and [`Self::CleanBound`]: what a range rule
+    /// could prepare behind its flight.
+    Ceiling,
+    /// [`Self::RangesOnly`] and [`Self::CleanActual`]: the same, if what a
+    /// flight marks were known before it ran.
+    Optimistic,
+}
+
+/// A flight as it landed, for the probe: its fence, why it was not quiet,
+/// the ranges it wrote (declared and bottom-of-pipe), and the pages its
+/// shaders marked.
+struct Landed {
+    fence: u64,
+    reasons: u8,
+    wrote: Vec<(usize, usize)>,
+    marked: Vec<(usize, usize)>,
+}
+
+/// What the landing in progress wrote, filled by [`probe_wrote`] and
+/// [`probe_marked`] (one landing at a time, under `Host::submitted`).
+/// Title ranges as start and length.
+type Spans = Vec<(usize, usize)>;
+static PROBE_SINK: std::sync::Mutex<(Spans, Spans)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
+static LAST_LANDED: std::sync::Mutex<Option<Landed>> = std::sync::Mutex::new(None);
+
+thread_local! {
+    /// While a flight is prepared with the probe on: the host-copy ranges
+    /// its refreshes rewrite (copy, address, bytes).
+    static PROBE_ASKED: std::cell::RefCell<Option<Vec<(usize, usize, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A refresh of a written copy's range (`crate::host::Batch::add`).
+pub(crate) fn probe_refresh(copy: usize, address: usize, len: usize) {
+    PROBE_ASKED.with(|p| {
+        if let Some(asked) = p.borrow_mut().as_mut() {
+            asked.push((copy, address, len));
+        }
+    });
+}
+
+/// A landing begins writing back.
+pub(crate) fn probe_landing_starts() {
+    if prep_ahead_enabled() {
+        let mut sink = PROBE_SINK.lock().unwrap_or_else(|e| e.into_inner());
+        sink.0.clear();
+        sink.1.clear();
+    }
+}
+
+/// The landing writes `[address, address + len)` of title memory: a range
+/// shaders declared, or a bottom-of-pipe write.
+pub(crate) fn probe_wrote(address: usize, len: usize) {
+    if prep_ahead_enabled() {
+        PROBE_SINK.lock().unwrap_or_else(|e| e.into_inner()).0.push((address, len));
+    }
+}
+
+/// The landing writes back a page shaders marked.
+pub(crate) fn probe_marked(address: usize, len: usize) {
+    if prep_ahead_enabled() {
+        PROBE_SINK.lock().unwrap_or_else(|e| e.into_inner()).1.push((address, len));
+    }
+}
+
+/// Whether any of the half-open `a` ranges overlaps any of `b` (each as
+/// start and length), sorting both.
+fn overlaps(a: &mut [(usize, usize)], b: &mut [(usize, usize)]) -> bool {
+    a.sort_unstable();
+    b.sort_unstable();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let (a0, a1) = (a[i].0, a[i].0.saturating_add(a[i].1));
+        let (b0, b1) = (b[j].0, b[j].0.saturating_add(b[j].1));
+        if a0 < b1 && b0 < a1 && a1 > a0 && b1 > b0 {
+            return true;
+        }
+        if a1 <= b1 { i += 1 } else { j += 1 }
+    }
+    false
+}
+
+/// Counts the preparation that just refreshed `asked` against `landed`, the
+/// flight that landed right before it.
+fn probe_compare(landed: &Landed, asked: &[(usize, usize, usize)]) {
+    use NotQuiet as N;
+    let bit = |r: N| landed.reasons & (1 << r as u8) != 0;
+    let ranges_only = landed.reasons & !((1 << N::Declared as u8) | (1 << N::Marks as u8) | (1 << N::BottomOfPipe as u8)) == 0;
+    let mut refreshed: Vec<(usize, usize)> = asked.iter().map(|&(_, a, n)| (a, n)).collect();
+    let clean_known = !overlaps(&mut refreshed, &mut landed.wrote.clone());
+    let mut actual: Vec<(usize, usize)> = landed.wrote.iter().chain(&landed.marked).copied().collect();
+    let clean_actual = !overlaps(&mut refreshed, &mut actual);
+    let clean_bound = clean_known && (!bit(N::Marks) || {
+        let owners = crate::shadow::mark_owners();
+        !asked.iter().any(|(copy, ..)| owners.contains(copy))
+    });
+    let count = |p: Probe, on: bool| {
+        if on {
+            PROBE[p as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    count(Probe::Behind, true);
+    count(Probe::RangesOnly, ranges_only);
+    count(Probe::CleanKnown, clean_known);
+    count(Probe::CleanActual, clean_actual);
+    count(Probe::CleanBound, clean_bound);
+    count(Probe::Ceiling, ranges_only && clean_bound);
+    count(Probe::Optimistic, ranges_only && clean_actual);
+}
+
+#[cfg(test)]
+pub(super) fn probe_counts() -> Vec<u64> {
+    PROBE.iter().map(|a| a.load(Ordering::Relaxed)).collect()
 }
 
 struct InFlight {
@@ -424,10 +601,23 @@ impl Host {
             let counter: *mut u64 = &mut *submitted;
             PREPARING_AHEAD.with(|c| c.set(Some((self as *const Host, counter))));
         }
+        let probing = ahead && !behind;
+        if probing {
+            PROBE_ASKED.with(|p| *p.borrow_mut() = Some(Vec::new()));
+        }
         let prep = {
             let run_refs: Vec<&HostList> = segments.iter().map(|s| &**s).collect();
             self.prepare_submission(next, &run_refs, &barrier_before, false)
         };
+        if probing {
+            let asked = PROBE_ASKED.with(|p| p.borrow_mut().take()).unwrap_or_default();
+            let landed = LAST_LANDED.lock().unwrap_or_else(|e| e.into_inner()).take();
+            // Only right behind the flight that landed last, with nothing
+            // submitted between.
+            if let Some(landed) = landed.filter(|l| l.reasons != 0 && l.fence == next) {
+                probe_compare(&landed, &asked);
+            }
+        }
         // Still behind a flight in the air: it lands before this one runs if
         // this one marks its writes, or if there is no second mark.
         if behind && segments.iter().any(|s| s.marks_writes()) {
@@ -733,6 +923,21 @@ impl Host {
                 None,
                 done,
             );
+        }
+
+        if prep_ahead_enabled() {
+            let mut reasons = flight.segments.iter().fold(0, |b, s| b | s.not_quiet_reasons());
+            if flight.uploads.is_some() {
+                reasons |= 1 << NotQuiet::Uploads as u8;
+            }
+            for r in 0..NOT_QUIET {
+                if reasons & (1 << r) != 0 {
+                    PROBE[Probe::Optimistic as usize + 1 + r].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let (wrote, marked) = std::mem::take(&mut *PROBE_SINK.lock().unwrap_or_else(|e| e.into_inner()));
+            *LAST_LANDED.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Landed { fence: done, reasons, wrote, marked });
         }
 
         // Return the upload list to `bindless::LIST` and recycle host lists
@@ -1388,6 +1593,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         seg
     }
 
+    /// Runs `attempt` until it took the path it tests (up to 20 times):
+    /// another test's `Host::quiet` (a heap made on its thread) lands every
+    /// flight in the air, so the flight a test holds may land before the
+    /// decision it tests. What each attempt checks of the results holds
+    /// either way.
+    fn until_taken(mut attempt: impl FnMut() -> bool) {
+        assert!(
+            (0..20).any(|_| attempt()),
+            "the flight held in the air was always landed by another thread first"
+        );
+    }
+
     /// With `VICTORY_PREP_AHEAD=1` a submission behind a quiet flight (one
     /// whose landing writes nothing back) is prepared while it is in the air
     /// and launched behind it: two in flight. Both run, the newer one's
@@ -1398,6 +1615,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             return;
         };
         let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        until_taken(|| launches_behind_once(host));
+    }
+
+    fn launches_behind_once(host: &Host) -> bool {
         // The frame's eviction pass is done: it would land the flight first.
         crate::resource::evict_unused();
         let (_q, f1) = make_queue_and_fence();
@@ -1430,16 +1651,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(host.attach_signal(f2, 1, false));
 
         let after = ahead_counts();
-        assert_eq!(after[0] - before[0], 1, "prepared while the first was in the air");
-        // Launched behind it, unless a pass another test asked for (an
-        // eviction or a view remake) landed it first.
-        let launched_behind = after[1] - before[1];
-        let landed_for_others = (after[2 + Early::Eviction as usize] - before[2 + Early::Eviction as usize])
-            + (after[2 + Early::Remake as usize] - before[2 + Early::Remake as usize]);
-        assert_eq!(launched_behind + landed_for_others, 1);
-        if launched_behind == 1 {
-            assert_eq!(flights_in_air(host), 2, "two in flight");
-        }
+        let taken = after[0] - before[0] == 1 && after[1] - before[1] == 1 && flights_in_air(host) == 2;
 
         TEST_PAUSE_LANDING.store(false, Ordering::Release);
         let start = Instant::now();
@@ -1460,8 +1672,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         assert!(!host.has_in_flight());
         drop(shadow);
-        // SAFETY: all flights landed.
-        unsafe { std::alloc::dealloc(title_ptr, layout) };
+        // Not freed: the next attempt gets other memory. Freed here, its host
+        // copy (still registered, as the title never released it) would be
+        // found again at the same address with this attempt's bytes.
+        let _ = layout;
+        taken
     }
 
     /// The hazard prep-ahead must not cross: a flight in the air whose
@@ -1475,6 +1690,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             return;
         };
         let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        until_taken(|| copy_back_once(host));
+    }
+
+    fn copy_back_once(host: &Host) -> bool {
         let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
         // SAFETY: valid layout; freed at the end.
         let title_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -1505,7 +1724,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute_flight1(vec![seg2], vec![]);
         let after = ahead_counts();
         assert_eq!(after[0], before[0], "prepared behind a flight that writes back");
-        assert_eq!(after[2 + Early::NotQuiet as usize] - before[2 + Early::NotQuiet as usize], 1);
+        let taken = after[2 + Early::NotQuiet as usize] - before[2 + Early::NotQuiet as usize] == 1;
 
         TEST_PAUSE_LANDING.store(false, Ordering::Release);
         host.finish_flight_now();
@@ -1515,8 +1734,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(out2_ptr.cast::<u32>().read_volatile(), 0xCAFE_BABE, "the refresh overwrote it");
         }
         drop(shadow);
-        // SAFETY: all flights landed.
-        unsafe { std::alloc::dealloc(title_ptr, layout) };
+        // Not freed: the next attempt gets other memory. Freed here, its host
+        // copy (still registered, as the title never released it) would be
+        // found again at the same address with this attempt's bytes.
+        let _ = layout;
+        taken
     }
 
     /// A submission whose shaders mark their writes is prepared behind a
@@ -1528,6 +1750,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             return;
         };
         let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        until_taken(|| marks_once(host));
+    }
+
+    fn marks_once(host: &Host) -> bool {
         crate::resource::evict_unused();
         let (out1, _) = host.mapped_buffer(64, true).expect("out1");
         let (out2, out2_ptr) = host.mapped_buffer(64, true).expect("out2");
@@ -1541,15 +1767,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute_flight1(vec![seg2], vec![]);
         let after = ahead_counts();
         let early = |e: Early| after[2 + e as usize] - before[2 + e as usize];
-        assert_eq!(after[0] - before[0], 1, "prepared while the first was in the air");
         assert_eq!(after[1], before[1], "launched while the first was in the air");
-        assert_eq!(early(Early::Marks) + early(Early::Eviction) + early(Early::Remake), 1);
-        assert_eq!(flights_in_air(host), 1);
+        let taken = after[0] - before[0] == 1 && early(Early::Marks) == 1;
 
         TEST_PAUSE_LANDING.store(false, Ordering::Release);
         host.finish_flight_now();
         // SAFETY: the flights have landed.
         assert_eq!(unsafe { out2_ptr.cast::<u32>().read_volatile() }, 0x3333_0003);
+        taken
     }
 
     /// A title copy in a submission is done on the CPU while it is
@@ -1561,6 +1786,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             return;
         };
         let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        until_taken(|| title_copy_once(host));
+    }
+
+    fn title_copy_once(host: &Host) -> bool {
         crate::resource::evict_unused();
         let (out1, _) = host.mapped_buffer(64, true).expect("out1");
         let from = [0x5eed_u64; 4];
@@ -1575,13 +1804,73 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute_flight1(vec![seg2], vec![]);
         let after = ahead_counts();
         let early = |e: Early| after[2 + e as usize] - before[2 + e as usize];
-        assert_eq!(after[0] - before[0], 1);
-        assert_eq!(early(Early::TitleCopy) + early(Early::Remake), 1, "landed first for the title copy");
-        assert_eq!(after[1], before[1]);
+        assert_eq!(after[1], before[1], "launched behind the flight with a title copy");
+        let taken = after[0] - before[0] == 1 && early(Early::TitleCopy) == 1;
 
         TEST_PAUSE_LANDING.store(false, Ordering::Release);
         host.finish_flight_now();
         assert_eq!(to, from);
+        taken
+    }
+
+    #[test]
+    fn overlaps_finds_shared_bytes_only() {
+        let a = [(100, 10), (0, 10)];
+        assert!(!overlaps(&mut a.clone(), &mut [(10, 90), (110, 5)]));
+        assert!(overlaps(&mut a.clone(), &mut [(109, 1)]));
+        assert!(!overlaps(&mut [(5, 0)], &mut [(0, 10)]), "an empty range");
+    }
+
+    /// The probe, behind a flight whose shaders write a declared range of
+    /// one host copy: a preparation refreshing another copy could have gone
+    /// ahead by ranges; one refreshing that range could not.
+    #[test]
+    fn prep_ahead_probe_counts_overlapping_and_disjoint_refreshes() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
+        // SAFETY: valid layouts; freed at the end.
+        let (a_ptr, b_ptr) = unsafe { (std::alloc::alloc_zeroed(layout), std::alloc::alloc_zeroed(layout)) };
+        let (a, b) = (a_ptr as u64, b_ptr as u64);
+        let (sa, sb) = (crate::shadow::find(a, 4096).expect("a"), crate::shadow::find(b, 4096).expect("b"));
+        let (src, _) = host.upload_buffer(64).expect("upload buffer");
+        let slot = |s: Probe| s as usize;
+        // One round: a flight writing `a`, then one refreshing `refreshed`
+        // after the title wrote it.
+        let round = |refreshed: u64, shadow: &Arc<crate::shadow::Shadow>| {
+            let seg1 = Arc::new(host.new_list().expect("seg1"));
+            // SAFETY: open host list, valid buffers.
+            unsafe { seg1.list.CopyBufferRegion(&sa.buffer, sa.offset(a), &src, 0, 4) };
+            seg1.keep(&src);
+            sa.gpu_writes(&seg1, a, 4, false);
+            seg1.close();
+            host.execute_flight1(vec![seg1], vec![]);
+            // SAFETY: the title's buffer.
+            unsafe { (refreshed as *mut u32).add(16).write_volatile(0x77) };
+            let seg2 = Arc::new(host.new_list().expect("seg2"));
+            shadow.refresh(&seg2, refreshed, 256);
+            seg2.close();
+            let before = probe_counts();
+            host.execute_flight1(vec![seg2], vec![]);
+            host.finish_flight_now();
+            let after = probe_counts();
+            [Probe::Behind, Probe::RangesOnly, Probe::CleanKnown, Probe::Ceiling]
+                .map(|p| after[slot(p)] - before[slot(p)])
+        };
+        let [behind, ranges, clean, ceiling] = round(b, &sb);
+        assert_eq!((behind, ranges), (1, 1), "compared behind a flight with declared writes only");
+        assert_eq!((clean, ceiling), (1, 1), "another copy: could go ahead");
+        let [behind, _, clean, ceiling] = round(a, &sa);
+        assert_eq!(behind, 1);
+        assert_eq!((clean, ceiling), (0, 0), "the range it wrote: could not");
+        drop((sa, sb));
+        // SAFETY: the flights have landed.
+        unsafe {
+            std::alloc::dealloc(a_ptr, layout);
+            std::alloc::dealloc(b_ptr, layout);
+        }
     }
 
     /// The fence [`recording_mapper`] reads, and what it saw: each mapping's
