@@ -2708,6 +2708,29 @@ pub(crate) fn refreshed_bytes(copy: &Arc<Shadow>) -> u64 {
         .map_or(0, |e| e.3)
 }
 
+/// The runtime's lookup of how title memory lies on its physical pages
+/// (pages, runs, sections; [`on_physical_runs`]).
+type PhysicalRuns = fn(usize, usize) -> Option<(usize, usize, usize)>;
+static PHYSICAL_RUNS: std::sync::OnceLock<PhysicalRuns> = std::sync::OnceLock::new();
+
+/// Sets the runtime's lookup of how title memory lies on its physical
+/// pages, for the refreshed-copies line: a host copy over memory in few
+/// runs of physical pages could be read by the GPU in place, if those
+/// pages were the GPU's memory.
+pub fn on_physical_runs(lookup: PhysicalRuns) {
+    let _ = PHYSICAL_RUNS.set(lookup);
+}
+
+/// `at`'s copy of `len` bytes on physical pages, for the line.
+fn physical_layout(at: usize, len: usize) -> String {
+    match PHYSICAL_RUNS.get().and_then(|lookup| lookup(at, len)) {
+        Some((pages, runs, sections)) => {
+            format!(", physical pages {pages} in {runs} runs over {sections} sections")
+        }
+        None => String::new(),
+    }
+}
+
 /// What memory title address `at` is, for the refreshed-copies line: its
 /// type (private: `XMemVirtualAlloc`, which zero-copy aliasing remaps;
 /// mapped: a section view, as physical pages are shown), protection, and
@@ -2766,11 +2789,12 @@ pub(crate) fn log_refreshed(frames: f64) {
             // aliasing does not reach (it remaps `XMemVirtualAlloc` commits).
             let shown = crate::watch::aliased(start as usize, len as usize);
             format!(
-                "{start:#x}+{:.1} MB{}{} [{}] {:.1} MB {:.1} ms",
+                "{start:#x}+{:.1} MB{}{} [{}{}] {:.1} MB {:.1} ms",
                 len as f64 / 1e6,
                 if t { "" } else { " (untracked)" },
                 if shown { " (shown at several addresses)" } else { "" },
                 memory_kind(start as usize),
+                physical_layout(start as usize, len as usize),
                 mb(bytes),
                 us as f64 / 1e3 / frames
             )

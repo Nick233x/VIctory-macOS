@@ -123,6 +123,8 @@ pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
+pub use shadow::on_physical_runs;
+#[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
     title_memory_remapped, title_memory_unmapping, writing as kernel_will_write,

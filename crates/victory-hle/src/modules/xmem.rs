@@ -718,6 +718,43 @@ fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
     }
 }
 
+/// How title memory `[at, at + len)` lies on the title's physical pages,
+/// for the GPU side's frame report (`victory_gpu::on_physical_runs`): the
+/// 64 KiB pages of it shown by physical-page views, the runs they make
+/// (pages one after another in one section, as a GPU buffer over that
+/// memory would need them), and the sections. `None` if none is shown so.
+pub(crate) fn physical_runs(at: usize, len: usize) -> Option<(usize, usize, usize)> {
+    let physical = physical();
+    let end = at.saturating_add(len);
+    let first = physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| *base + size > at)
+        .map(|(base, _)| *base)
+        .unwrap_or(at);
+    let (mut pages, mut runs) = (0, 0);
+    let mut sections = std::collections::HashSet::new();
+    // The (section, index) the next page would continue a run with.
+    let mut next: Option<(usize, usize)> = None;
+    let mut last_end = usize::MAX;
+    for (&base, (size, slice)) in physical.views.range(first..end) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        sections.insert(section);
+        let (from, to) = (at.max(base), end.min(base + size));
+        for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
+            let here = (section, slice.index + (page - base) / PAGE);
+            if next != Some(here) || last_end != page {
+                runs += 1;
+            }
+            pages += 1;
+            next = Some((here.0, here.1 + 1));
+            last_end = page + PAGE;
+        }
+    }
+    (pages > 0).then_some((pages, runs, sections.len()))
+}
+
 /// The addresses of title views showing `pages` (page numbers): writes into
 /// them through our own views must be reported there.
 fn shown_at(pages: &[usize]) -> Vec<usize> {
@@ -1906,6 +1943,22 @@ mod tests {
             TEST_LEAN.with(|c| c.set(self.prev_lean));
             TEST_MAP_RUNS.with(|c| c.set(self.prev_runs));
         }
+    }
+
+    #[test]
+    fn physical_runs_count_pages_one_after_another_in_a_section() {
+        let pages = allocate(4);
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!at.is_null());
+        // Pages 0, 1, then 3, 2: a run of two, then two runs of one.
+        let order = [pages[0], pages[1], pages[3], pages[2]];
+        assert_eq!(XMemMapPhysicalPages(at, 4, order.as_ptr()), at);
+        assert_eq!(physical_runs(at as usize, 4 * PAGE), Some((4, 3, 1)));
+        assert_eq!(physical_runs(at as usize, 2 * PAGE), Some((2, 1, 1)), "the first two in order");
+        assert_eq!(physical_runs(at as usize + 3 * PAGE + 100, 8), Some((1, 1, 1)));
+        // Not physical memory.
+        let plain = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE);
+        assert_eq!(physical_runs(plain as usize, PAGE), None);
     }
 
     #[test]
