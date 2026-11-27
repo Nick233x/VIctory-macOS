@@ -4718,13 +4718,26 @@ pub(crate) mod tests {
         assert!(loose(0, 16).is_none());
         assert!(loose(0x1000, 0x1010).is_none());
         assert!(loose(LOWEST_MAPPED - 1, LOWEST_MAPPED + 1).is_none());
-        // Reserved, not committed.
-        // SAFETY: a fresh reservation, released below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), loose_window_bytes() as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
-        assert_ne!(p, 0);
+        // Reserved, not committed. Memory another test gave back may still
+        // have a copy registered over it (that one is found, as it should
+        // be): such a reservation is held, and another taken.
+        let window = loose_window_bytes() as usize;
+        let mut held = Vec::new();
+        let p = loop {
+            // SAFETY: a fresh reservation, released below.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), window, MEM_RESERVE, PAGE_READWRITE) } as u64;
+            assert_ne!(p, 0);
+            if over(p as usize, p as usize + window).is_empty() {
+                break p;
+            }
+            assert!(held.len() < 8, "no reservation without a copy over it");
+            held.push(p);
+        };
         assert!(loose(p + 64, p + 128).is_none());
-        // SAFETY: our reservation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        for p in held.into_iter().chain([p]) {
+            // SAFETY: our reservation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
         // Too close to the top to round up to a window.
         assert!(loose(u64::MAX - 8, u64::MAX).is_none());
     }

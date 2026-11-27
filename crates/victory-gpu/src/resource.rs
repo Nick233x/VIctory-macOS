@@ -3998,6 +3998,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        // Synchronous, and not while another test runs Flight-1: what it
+        // checks right after submitting assumes the submission has run.
+        let _mode = crate::host::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -4070,6 +4073,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        // Synchronous, and not while another test runs Flight-1: what it
+        // checks right after submitting assumes the submission has run.
+        let _mode = crate::host::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;

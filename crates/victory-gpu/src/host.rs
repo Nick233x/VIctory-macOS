@@ -7,6 +7,8 @@
 mod flight;
 pub(crate) mod same_copy;
 pub(crate) use flight::{async_submit_enabled, flight1_enabled, probe_marked};
+#[cfg(test)]
+pub(crate) use flight::ModeGuard;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
