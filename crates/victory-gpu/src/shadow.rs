@@ -2246,12 +2246,35 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
 fn loose_window_bytes() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
-        if crate::switch::on("VICTORY_SMALL_LOOSE_WINDOWS") {
-            256 << 10
-        } else {
-            4 << 20
-        }
+        let asked = std::env::var_os("VICTORY_SMALL_LOOSE_WINDOWS")
+            .map(|v| crate::switch::value_is_on(Some(&v)));
+        let ram = crate::alias::total_ram_bytes();
+        let bytes = loose_window_size(asked, crate::watch::rosetta(), ram);
+        tracing::debug!(bytes, "loose window size");
+        bytes
     })
+}
+
+/// Loose windows of 256 KiB and of 4 MiB.
+const SMALL_WINDOW: u64 = 256 << 10;
+const LARGE_WINDOW: u64 = 4 << 20;
+
+/// The most memory with which a Mac takes [`SMALL_WINDOW`]s unasked. Where
+/// it was measured, the small windows held far less: 4.0 GB of host copies
+/// instead of 7.1 GB and a working set of 17.9 GB instead of 22.2 GB (#165,
+/// M5 Max), and 2.9 GB of loose windows instead of 5.6 to 6.1 GB, with 20
+/// to 26 % of a 24 GB Mac free instead of 14 % (#454). The frame rate was
+/// within the noise both times; there were about 2.4 times as many copies.
+/// A Mac with this much memory or less runs out of it first.
+const SMALL_WINDOWS_MAX_RAM: u64 = 32 << 30;
+
+/// The loose window size: [`SMALL_WINDOW`] if `asked` (`VICTORY_SMALL_LOOSE_WINDOWS`
+/// set and not `0`), [`LARGE_WINDOW`] if asked not to; unasked, small on a
+/// Mac (`rosetta`) with [`SMALL_WINDOWS_MAX_RAM`] or less, else large.
+fn loose_window_size(asked: Option<bool>, rosetta: bool, total_ram: Option<u64>) -> u64 {
+    let small = asked
+        .unwrap_or_else(|| rosetta && total_ram.is_some_and(|ram| ram <= SMALL_WINDOWS_MAX_RAM));
+    if small { SMALL_WINDOW } else { LARGE_WINDOW }
 }
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -4046,6 +4069,24 @@ pub(crate) mod tests {
         unregister(1, base);
         assert_eq!(found, Some((base, 1)));
         assert!(buffers().range((base, 0)..=(base + len, usize::MAX)).next().is_none());
+    }
+
+    #[test]
+    fn loose_windows_are_small_on_macs_with_up_to_32_gib_unless_asked() {
+        let gib = 1u64 << 30;
+        // Unasked: by the Mac's memory.
+        for ram in [8, 16, 18, 24, 32] {
+            assert_eq!(loose_window_size(None, true, Some(ram * gib)), SMALL_WINDOW, "{ram} GiB");
+        }
+        for ram in [36, 48, 64, 128] {
+            assert_eq!(loose_window_size(None, true, Some(ram * gib)), LARGE_WINDOW, "{ram} GiB");
+        }
+        assert_eq!(loose_window_size(None, true, None), LARGE_WINDOW, "memory unknown");
+        assert_eq!(loose_window_size(None, false, Some(16 * gib)), LARGE_WINDOW, "not a Mac");
+        // Asked: as asked, whatever the memory.
+        assert_eq!(loose_window_size(Some(false), true, Some(16 * gib)), LARGE_WINDOW);
+        assert_eq!(loose_window_size(Some(true), false, Some(128 * gib)), SMALL_WINDOW);
+        assert_eq!(loose_window_size(Some(true), true, None), SMALL_WINDOW);
     }
 
     #[test]
