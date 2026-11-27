@@ -254,7 +254,7 @@ fn fast_heap_sync_value(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
 }
 
-/// `VICTORY_HEAP_READ_ONCE=1` (off by default): a heap sync reads the
+/// `VICTORY_HEAP_READ_ONCE` (on by default; `0` turns it off): a heap sync reads the
 /// records of the slots it makes again once, from the first to the last, in
 /// one read through the kernel, instead of one 12-byte read a slot. The
 /// world makes ~41,000 slots a frame again, and a read costs 0.46 µs under
@@ -267,7 +267,13 @@ fn heap_read_once() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_READ_ONCE"))
+    *ON.get_or_init(|| heap_read_once_value(std::env::var_os("VICTORY_HEAP_READ_ONCE").as_deref()))
+}
+
+/// On unless `0`: run G (in the world, ~2,700 frames) showed no difference
+/// but the time, and the bytes are the same ones.
+fn heap_read_once_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
 }
 
 #[cfg(test)]
@@ -1777,6 +1783,13 @@ impl HostHeap {
             }
         }
 
+        use crate::descriptor::{SyncStat as S, sync_stat};
+        let lap = |stat: S, since: &mut std::time::Instant| {
+            let now = std::time::Instant::now();
+            sync_stat(stat, (now - *since).as_micros() as u64);
+            *since = now;
+        };
+        let mut clock = std::time::Instant::now();
         let at_once = placed_at_once();
         let pins = views_at_batch(&unique_keys);
         let mut defer: Vec<bool> = Vec::with_capacity(unique_keys.len());
@@ -1798,6 +1811,7 @@ impl HostHeap {
             }
         }
 
+        lap(S::PrepareUs, &mut clock);
         // Initialize the staging heap before acquiring `self.made`.
         let staging = self.staging();
         let host = host();
@@ -1820,6 +1834,17 @@ impl HostHeap {
             };
             let mut forgot_reads: Vec<u32> = Vec::new();
             let mut finalize: Vec<(u32, u64, u64)> = Vec::with_capacity(stale.len());
+            // What the slots took, for the frame report's line.
+            let (mut unchanged, mut from_template, mut deferred, mut nulled) = (0u64, 0u64, 0u64, 0u64);
+            let mut created: Vec<u64> = Vec::new();
+            let mut create_us = 0u64;
+            let mut make_marked = |view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, key: u64| {
+                let started = std::time::Instant::now();
+                let made = make_marked(view, at);
+                create_us += started.elapsed().as_micros() as u64;
+                created.push(key);
+                made
+            };
             let addr_data = self
                 .addresses
                 .get()
@@ -1872,6 +1897,7 @@ impl HostHeap {
                 });
                 let Some((kidx, key, view)) = resolved else {
                     if made[index as usize] != 0 {
+                        nulled += 1;
                         self.ready[index as usize].store(0, Ordering::Relaxed);
                         self.synced[index as usize].store(0, Ordering::Relaxed);
                         made[index as usize] = 0;
@@ -1899,6 +1925,7 @@ impl HostHeap {
                     continue;
                 };
                 if made[index as usize] == key {
+                    unchanged += 1;
                     continue;
                 }
                 self.ready[index as usize].store(0, Ordering::Relaxed);
@@ -1918,6 +1945,7 @@ impl HostHeap {
                 made[index as usize] = key;
 
                 let (kept, mark) = if later {
+                    deferred += 1;
                     if !self.sampler && !keep_old {
                         if let (Some(_), Some(st)) = (host, staging) {
                             let null_slot = null_slot_index(false, Some(view));
@@ -1932,13 +1960,14 @@ impl HostHeap {
                     && let (Some(_), Some(st)) = (host, staging)
                 {
                     if let Some(tpl) = &templates[kidx] {
+                        from_template += 1;
                         copy_dsts.push(self.cpu(index));
                         copy_srcs.push(tpl.src);
                         (tpl.kept.clone(), tpl.mark)
                     } else if next_template < st.count {
                         let t = next_template;
                         next_template += 1;
-                        let (k, m) = make_marked(view, st.cpu(t));
+                        let (k, m) = make_marked(view, st.cpu(t), key);
                         let src = if k.is_none() && !self.sampler {
                             st.cpu(null_slot_index(false, Some(view)))
                         } else {
@@ -1953,7 +1982,7 @@ impl HostHeap {
                         });
                         (k, m)
                     } else {
-                        let (k, m) = make_marked(view, self.cpu(index));
+                        let (k, m) = make_marked(view, self.cpu(index), key);
                         if k.is_none() && !self.sampler {
                             let null_slot = null_slot_index(false, Some(view));
                             copy_dsts.push(self.cpu(index));
@@ -1962,7 +1991,7 @@ impl HostHeap {
                         (k, m)
                     }
                 } else {
-                    let (k, m) = make_marked(view, self.cpu(index));
+                    let (k, m) = make_marked(view, self.cpu(index), key);
                     if k.is_none() && !self.sampler {
                         if let (Some(_), Some(st)) = (host, staging) {
                             let null_slot = null_slot_index(false, Some(view));
@@ -1993,6 +2022,19 @@ impl HostHeap {
                 finalize.push((index, key, ready));
             }
 
+            lap(S::LoopUs, &mut clock);
+            {
+                sync_stat(S::Unchanged, unchanged);
+                sync_stat(S::Created, created.len() as u64);
+                sync_stat(S::CreateUs, create_us);
+                sync_stat(S::FromTemplate, from_template);
+                sync_stat(S::Deferred, deferred);
+                sync_stat(S::Nulled, nulled);
+                if crate::descriptor::view_probe() {
+                    sync_stat(S::SeenBefore, crate::descriptor::seen_before(&created));
+                }
+            }
+            let copying = std::time::Instant::now();
             if !copy_dsts.is_empty()
                 && let (Some(h), Some(st)) = (host, staging)
             {
@@ -2014,10 +2056,14 @@ impl HostHeap {
                 }
             }
 
+            sync_stat(S::CopyUs, copying.elapsed().as_micros() as u64);
+            clock = std::time::Instant::now();
             self.keep_batch(kept_updates, &mut retired);
+            lap(S::KeepUs, &mut clock);
             if !self.sampler {
                 self.viewed.set_batch(&viewed_updates);
             }
+            lap(S::ViewedUs, &mut clock);
             crate::shadow::forget_reads(&forgot_reads);
             // Coalesce `made_nonzero` bit updates per 64-slot word (stale indices
             // arrive in ascending order): set nonzero bits before publishing
@@ -5421,6 +5467,27 @@ mod tests {
             "a slot made again: {:.2} us with a read each, {:.2} us reading the records once",
             times[0], times[1]
         );
+        // Both runs' split (two heaps, 21 syncs of every slot each).
+        let st = crate::descriptor::SYNC_STATS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        eprintln!(
+            "made again {}: unchanged {}, created {} ({} us), from a template {}; us: prepare {}, loop {}, copy {}, keep {}, viewed {}, all making {}",
+            st[7], st[8], st[9], st[10], st[11], st[16], st[17], st[15], st[18], st[19], st[6]
+        );
+    }
+
+    #[test]
+    fn reading_records_once_is_on_unless_zero() {
+        assert!(heap_read_once_value(None));
+        assert!(heap_read_once_value(Some(std::ffi::OsStr::new("1"))));
+        assert!(!heap_read_once_value(Some(std::ffi::OsStr::new("0"))));
+    }
+
+    #[test]
+    fn the_view_probe_counts_descriptors_an_earlier_sync_created() {
+        // Keys no other test makes (generation 0xffff_fff0..).
+        let keys: Vec<u64> = (0..4).map(|i| (0xffff_fff0u64 + i) << 32 | 7).collect();
+        assert_eq!(crate::descriptor::seen_before(&keys[..2]), 0);
+        assert_eq!(crate::descriptor::seen_before(&keys), 2, "the first two again");
     }
 
     /// The records of slots made again are the same read once as read one

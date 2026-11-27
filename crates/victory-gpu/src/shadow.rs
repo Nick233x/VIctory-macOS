@@ -2708,6 +2708,42 @@ pub(crate) fn refreshed_bytes(copy: &Arc<Shadow>) -> u64 {
         .map_or(0, |e| e.3)
 }
 
+/// What memory title address `at` is, for the refreshed-copies line: its
+/// type (private: `XMemVirtualAlloc`, which zero-copy aliasing remaps;
+/// mapped: a section view, as physical pages are shown), protection, and
+/// the region of its allocation it lies in.
+fn memory_kind(at: usize) -> String {
+    use windows_sys::Win32::System::Memory::{
+        MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: a plain query into a local.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is valid for writes of its size.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return "unknown".to_owned();
+    }
+    let kind = match info.Type {
+        MEM_PRIVATE => "private",
+        MEM_MAPPED => "mapped",
+        MEM_IMAGE => "image",
+        _ => "other",
+    };
+    format!(
+        "{kind}, protect {:#x}, allocation {:#x}, region {:.1} MB",
+        info.Protect,
+        info.AllocationBase as usize,
+        info.RegionSize as f64 / 1e6
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn memory_kind_names_private_memory() {
+    let mut v = vec![0u8; 1 << 16];
+    let at = v.as_mut_ptr() as usize;
+    assert!(memory_kind(at).starts_with("private, protect 0x4"), "{}", memory_kind(at));
+}
+
 /// The frame report's line: how many copies were refreshed, the bytes of
 /// tracked and untracked ones, and the five that took most, per frame.
 pub(crate) fn log_refreshed(frames: f64) {
@@ -2730,10 +2766,11 @@ pub(crate) fn log_refreshed(frames: f64) {
             // aliasing does not reach (it remaps `XMemVirtualAlloc` commits).
             let shown = crate::watch::aliased(start as usize, len as usize);
             format!(
-                "{start:#x}+{:.1} MB{}{} {:.1} MB {:.1} ms",
+                "{start:#x}+{:.1} MB{}{} [{}] {:.1} MB {:.1} ms",
                 len as f64 / 1e6,
                 if t { "" } else { " (untracked)" },
                 if shown { " (shown at several addresses)" } else { "" },
+                memory_kind(start as usize),
                 mb(bytes),
                 us as f64 / 1e3 / frames
             )

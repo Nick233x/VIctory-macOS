@@ -227,8 +227,8 @@ fn mirror(handle: u64) {
 /// Where [`sync_heaps`] spends its time, since the last frame report:
 /// [`SyncStat`]'s slots. Always counted (a few clock reads a page): the
 /// frame report's "heap views synced" phase is the largest of preparing.
-pub(crate) static SYNC_STATS: [std::sync::atomic::AtomicU64; 8] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+pub(crate) static SYNC_STATS: [std::sync::atomic::AtomicU64; 20] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 20];
 
 /// [`SYNC_STATS`]'s slots.
 #[derive(Clone, Copy)]
@@ -249,6 +249,31 @@ pub(crate) enum SyncStat {
     MakeUs,
     /// Slots made again.
     Made,
+    /// Of them: already holding that view (nothing done).
+    Unchanged,
+    /// Views created (`make`).
+    Created,
+    /// Microseconds creating them.
+    CreateUs,
+    /// Copied from a view created for another slot in the same sync.
+    FromTemplate,
+    /// Left null until a draw reads them (placed textures).
+    Deferred,
+    /// Made null (no view of ours any more).
+    Nulled,
+    /// Created views whose descriptor an earlier sync created already
+    /// (`VICTORY_VIEW_PROBE=1`): what a cache across syncs would save.
+    SeenBefore,
+    /// Microseconds copying descriptors (`CopyDescriptors`).
+    CopyUs,
+    /// Microseconds looking the views up and preparing them (`prepare`).
+    PrepareUs,
+    /// Microseconds of the loop over the slots, creating included.
+    LoopUs,
+    /// Microseconds keeping what the slots view (`keep_batch`).
+    KeepUs,
+    /// Microseconds noting what the slots view (`viewed.set_batch`).
+    ViewedUs,
 }
 
 /// Adds `n` to `stat`.
@@ -273,6 +298,53 @@ pub(crate) fn log_sync(frames: f64) {
         ms(s[4]),
         ms(s[6]),
     );
+    tracing::info!(
+        "heap slots made again per frame: holding that view already {:.0}, views created {:.0} ({:.1} ms{}), \
+         copied from one created in the same sync {:.0}, left null for draws {:.0}, made null {:.0}; ms: looking \
+         the views up and preparing them {:.1}, the slots' loop {:.1}, copying descriptors {:.1}, keeping what they \
+         view {:.1}, noting it {:.1}, the rest {:.1}",
+        per(s[8]),
+        per(s[9]),
+        ms(s[10]),
+        if view_probe() {
+            format!(", {:.0} of them created by an earlier sync", per(s[14]))
+        } else {
+            String::new()
+        },
+        per(s[11]),
+        per(s[12]),
+        per(s[13]),
+        ms(s[16]),
+        ms(s[17]),
+        ms(s[15]),
+        ms(s[18]),
+        ms(s[19]),
+        ms(s[6].saturating_sub(s[15] + s[16] + s[17] + s[18] + s[19])),
+    );
+}
+
+/// `VICTORY_VIEW_PROBE=1` (off by default): counts views a heap sync
+/// creates whose descriptor (view and generation) an earlier sync created
+/// already, the ceiling of a cache of views across syncs.
+pub(crate) fn view_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_VIEW_PROBE"))
+}
+
+/// The descriptors earlier syncs created (`VICTORY_VIEW_PROBE=1`), bounded:
+/// cleared once it holds [`SEEN_MAX`].
+static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
+const SEEN_MAX: usize = 1 << 20;
+
+/// Notes the descriptors a sync created (`keys`); returns how many an
+/// earlier sync created already.
+pub(crate) fn seen_before(keys: &[u64]) -> u64 {
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(Default::default);
+    if seen.len() > SEEN_MAX {
+        seen.clear();
+    }
+    keys.iter().filter(|&&k| !seen.insert(k)).count() as u64
 }
 
 /// Mirrors what the title wrote into its shader-visible heaps without a
