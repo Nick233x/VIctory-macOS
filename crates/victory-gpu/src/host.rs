@@ -7688,6 +7688,10 @@ mod marks {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
+        // Synchronous, and not while another test runs Flight-1: there the
+        // submission below returned before it ran, and the check after it
+        // failed now and then in the full suite.
+        let _mode = super::flight::ModeGuard::new(false, false);
         let mark = host.mark().expect("the mark list");
         let old = host.queue();
         {
