@@ -103,6 +103,10 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     /// The list every submission ends with, made on first use ([`Mark`]).
     mark: OnceLock<Option<Mark>>,
+    /// With `VICTORY_PREP_AHEAD=1`, two host submissions may be in flight:
+    /// those with an even fence value end with this mark instead
+    /// ([`Host::mark_for`]), so arming one never changes the other's.
+    mark_even: OnceLock<Option<Mark>>,
     /// Extra marks for native calls before the final call of a split submission.
     split_marks: Mutex<Option<Vec<Mark>>>,
     /// Reusable global UAV barrier lists inserted between coalesced queue pieces.
@@ -456,6 +460,7 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
+            mark_even: OnceLock::new(),
             split_marks: Mutex::new(Some(Vec::new())),
             barrier_lists: Mutex::new(Some(Vec::new())),
             event,
@@ -1861,6 +1866,9 @@ struct Deferred {
     waits: Vec<crate::hold::ValueWait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Whether the list binds the bitmaps shaders mark their writes through
+    /// views in ([`crate::shadow::copy_back_marks`]).
+    marks: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -2050,7 +2058,14 @@ impl HostGpu for Host {
     /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
     /// that holds the submission lock already, nor off Wine.
     fn quiet(&self) -> Option<Quiet<'_>> {
-        if !crate::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+        if !crate::under_wine() {
+            return None;
+        }
+        if HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            // A submission being prepared behind one in flight
+            // (`VICTORY_PREP_AHEAD=1`) lands it first: the GPU is idle
+            // around a heap's fill, as when it is prepared after it.
+            flight::land_ahead(flight::Early::Quiet);
             return None;
         }
         let mut held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -2099,7 +2114,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let gpu_timing = false;
 
-        let mut prep = self.prepare_submission(&submitted, runs, barrier_before, gpu_timing);
+        let mut prep = self.prepare_submission(*submitted, runs, barrier_before, gpu_timing);
         let run_refs: Vec<&HostList> = prep
             .uploads
             .as_ref()
@@ -2306,7 +2321,7 @@ impl Host {
     /// indirect clamps).
     fn prepare_submission(
         &self,
-        submitted: &u64,
+        submitted: u64,
         runs: &[&HostList],
         barrier_before: &[bool],
         gpu_timing: bool,
@@ -2320,10 +2335,16 @@ impl Host {
         crate::copystat::add(crate::copystat::C::ExecuteLists, runs.len() as u64);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        // With `VICTORY_PREP_AHEAD=1` a submission still in flight lands
+        // first (nothing otherwise): eviction gives up what it may use.
+        if crate::resource::evict_due() {
+            flight::land_ahead(flight::Early::Eviction);
+        }
         crate::resource::evict_unused();
         // The first shader writing through a heap may run in this
         // submission: unordered views left null are made again first.
         if crate::bindless::take_remake() {
+            flight::land_ahead(flight::Early::Remake);
             crate::descriptor::remake_unordered();
         }
         // Descriptors the title copied into its heaps itself, before the
@@ -2393,7 +2414,7 @@ impl Host {
                     tracing::info!(
                         target: "victory_gpu::trace",
                         "s{} l{i}/{} #{k}: {note}",
-                        *submitted + 1,
+                        submitted + 1,
                         runs.len()
                     );
                 }
@@ -2401,6 +2422,10 @@ impl Host {
         }
         let split_preludes = !gpu_timing && split_uav_srv_prelude();
         let needed_barriers = barrier_before.iter().copied().filter(|&b| b).count();
+        // The barrier lists are shared: one submission runs them at a time.
+        if needed_barriers > 0 {
+            flight::land_ahead(flight::Early::Barriers);
+        }
         let mut barrier_pool = (needed_barriers > 0)
             .then(|| self.barrier_lists.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(pool) = barrier_pool.as_deref_mut()
@@ -2426,6 +2451,12 @@ impl Host {
             Vec::with_capacity(2 * runs.len() + needed_barriers);
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        // Title copies are done here on the CPU, ahead of the GPU work before
+        // them: a submission in flight that reads their destinations' host
+        // copies lands first (`VICTORY_PREP_AHEAD=1`).
+        if runs.iter().any(|r| r.batch_flags().has_title_copy) {
+            flight::land_ahead(flight::Early::TitleCopy);
+        }
         let mut batch = Batch::take();
         for (idx, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
@@ -2454,7 +2485,7 @@ impl Host {
         drop(barrier_pool);
         batch.flush();
         #[cfg(feature = "diagnostics")]
-        batch.log_refreshes(*submitted + 1, runs.len());
+        batch.log_refreshes(submitted + 1, runs.len());
         #[cfg(not(feature = "diagnostics"))]
         let _ = submitted;
         let prepared = std::time::Instant::now();
@@ -2781,6 +2812,23 @@ impl Host {
 
     /// The list submissions end with ([`Mark`]); `None` if it could not be
     /// made, and then submissions are not checked.
+    /// The mark the host submission with fence `value` ends with: [`Self::mark`],
+    /// or with `VICTORY_PREP_AHEAD=1` the second one for even values (two
+    /// submissions in flight have consecutive values).
+    fn mark_for(&self, value: u64) -> Option<&Mark> {
+        if flight::prep_ahead_enabled() && value.is_multiple_of(2) {
+            return self
+                .mark_even
+                .get_or_init(|| {
+                    Mark::new(self)
+                        .inspect_err(|e| tracing::warn!(error = %e, "no second submission mark"))
+                        .ok()
+                })
+                .as_ref();
+        }
+        self.mark()
+    }
+
     fn mark(&self) -> Option<&Mark> {
         self.mark
             .get_or_init(|| {
@@ -3944,6 +3992,12 @@ impl HostList {
             .note_write(address as u64, len as u64);
     }
 
+    /// Notes that the list binds the view write bitmaps: its shaders may
+    /// mark what they write ([`Self::marks_writes`]).
+    pub(crate) fn note_marks(&self) {
+        self.deferred().marks = true;
+    }
+
     /// Notes that an earlier command in this list may write arbitrary title
     /// buffers on the GPU (bindless heap UAVs or page-table memory writes).
     pub(crate) fn note_unknown_gpu_write(&self) {
@@ -4148,6 +4202,36 @@ impl HostList {
 
     /// Summary of deferred CPU/GPU side effects on this list for submission
     /// coalescing (`crate::hold::can_join_batch`).
+    /// Whether the list's landing changes nothing a later submission's
+    /// preparation reads: no ranges or texels go back to title memory, no
+    /// shader marks, no work after it or bottom-of-pipe writes, and no
+    /// staging of its own uploads still read (`VICTORY_PREP_AHEAD`).
+    pub(crate) fn quiet_at_landing(&self) -> bool {
+        let marks = self.marks_writes();
+        let d = self.deferred();
+        !marks
+            && d.after.is_empty()
+            && d.writes.is_empty()
+            && d.texture_backs.is_empty()
+            && d.back_wanted.is_empty()
+            && !d
+                .copies
+                .iter()
+                .any(|s| matches!(s, Step::GpuWrite(..) | Step::Texture(..)))
+    }
+
+    /// Whether the list's shaders may mark what they write in the view
+    /// write bitmaps, which every landing takes
+    /// ([`crate::shadow::copy_back_marks`]).
+    pub(crate) fn marks_writes(&self) -> bool {
+        let unknown = self.clamps.lock().unwrap_or_else(|e| e.into_inner()).hazard.unknown;
+        let d = self.deferred();
+        unknown
+            || d.marks
+            || !d.missed.is_empty()
+            || d.copies.iter().any(|s| matches!(s, Step::GpuWrite(_, _, _, true, _)))
+    }
+
     pub(crate) fn batch_flags(&self) -> crate::hold::BatchFlags {
         let d = self.deferred();
         let mut flags = crate::hold::BatchFlags {

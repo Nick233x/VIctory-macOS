@@ -85,6 +85,8 @@ static TEST_FLIGHT1: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::
 #[cfg(test)]
 static TEST_ASYNC_SUBMIT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(test)]
+static TEST_PREP_AHEAD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
 static TEST_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
@@ -92,11 +94,16 @@ pub(crate) struct ModeGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     prev_flight1: u8,
     prev_async: u8,
+    prev_ahead: u8,
 }
 
 #[cfg(test)]
 impl ModeGuard {
     pub(crate) fn new(flight1: bool, async_submit: bool) -> Self {
+        Self::with_prep_ahead(flight1, async_submit, false)
+    }
+
+    pub(crate) fn with_prep_ahead(flight1: bool, async_submit: bool, ahead: bool) -> Self {
         let lock = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::queue::drain_submit(crate::queue::Why::Present);
         if let Some(h) = super::host() {
@@ -104,10 +111,12 @@ impl ModeGuard {
         }
         let prev_flight1 = TEST_FLIGHT1.swap(if flight1 { 2 } else { 1 }, Ordering::AcqRel);
         let prev_async = TEST_ASYNC_SUBMIT.swap(if async_submit { 2 } else { 1 }, Ordering::AcqRel);
+        let prev_ahead = TEST_PREP_AHEAD.swap(if ahead { 2 } else { 1 }, Ordering::AcqRel);
         Self {
             _lock: lock,
             prev_flight1,
             prev_async,
+            prev_ahead,
         }
     }
 }
@@ -119,8 +128,14 @@ impl Drop for ModeGuard {
         if let Some(h) = super::host() {
             h.finish_flight_now();
         }
+        TEST_PAUSE_LANDING.store(false, Ordering::Release);
+        crate::queue::drain_submit(crate::queue::Why::Present);
+        if let Some(h) = super::host() {
+            h.finish_flight_now();
+        }
         TEST_FLIGHT1.store(self.prev_flight1, Ordering::Release);
         TEST_ASYNC_SUBMIT.store(self.prev_async, Ordering::Release);
+        TEST_PREP_AHEAD.store(self.prev_ahead, Ordering::Release);
     }
 }
 
@@ -128,18 +143,16 @@ impl Drop for ModeGuard {
 /// `Host::submitted`, above only `Fence::waiters`).
 #[derive(Default)]
 pub(super) struct FlightState {
-    /// True from the moment a flight is launched until its post-GPU copy-back,
-    /// BoP writes, and attached signals have all completed. While `true`,
-    /// `attach_signal` queues behind the active flight instead of signalling
-    /// immediately.
-    active: bool,
-    /// The launched flight awaiting wait + landing; taken once by whichever
-    /// thread (`victory-flight` or the next submission) lands it under
-    /// `Host::submitted`.
-    in_flight: Option<InFlight>,
-    /// Title fences queued behind the active flight (each kept alive via
-    /// `fence::keep`). Delivered atomically before clearing `active`.
-    pending_signals: Vec<(usize, u64)>,
+    /// The launched flights awaiting wait + landing, oldest first: one, or
+    /// with `VICTORY_PREP_AHEAD=1` two. Each is taken once, the oldest
+    /// first, by whichever thread lands it under `Host::submitted`.
+    flights: std::collections::VecDeque<InFlight>,
+    /// True while a flight taken from `flights` lands (its copy-back, BoP
+    /// writes and signals): `attach_signal` then queues behind it.
+    landing: bool,
+    /// Title fences queued behind the landing flight (each kept alive via
+    /// `fence::keep`), delivered when it has landed.
+    landing_signals: Vec<(usize, u64)>,
     /// Whether the background `victory-flight` finisher thread has been spawned.
     worker_started: bool,
     /// When the host GPU last finished our work (a landed flight's fence, or
@@ -159,9 +172,10 @@ static FLIGHTS: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 enum Step {
     /// From asking to launch to the flight before it having landed (its GPU
-    /// time left and its copy-back, under Wait-Before-Prep).
+    /// time left and its copy-back), when it had to.
     Landing,
-    /// Preparing: refreshing host copies and textures, heaps, preludes.
+    /// Preparing: refreshing host copies and textures, heaps, preludes (and,
+    /// prepared ahead, landing the flight before it where something needed it).
     Preparing,
     /// The host `ExecuteCommandLists` and `Signal` calls.
     Launching,
@@ -201,11 +215,102 @@ pub(crate) fn take_flight_times() -> (u64, [u64; 5]) {
     )
 }
 
+/// Why a flight prepared ahead (`VICTORY_PREP_AHEAD=1`) landed the one in
+/// the air before it launched ([`land_ahead`]); [`AHEAD`] counts them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Early {
+    /// The flight in the air was not quiet at landing: its copy-back, marks,
+    /// work after it or uploads change what a preparation reads. Landed
+    /// before preparing (as without the switch).
+    NotQuiet,
+    /// The frame's eviction pass gives up host objects.
+    Eviction,
+    /// Unordered views are made again.
+    Remake,
+    /// The shared UAV barrier lists are needed.
+    Barriers,
+    /// A shader-visible heap is made and filled (`Host::quiet`).
+    Quiet,
+    /// The new flight's title copies, done on the CPU while preparing.
+    TitleCopy,
+    /// The new flight's shaders mark what they write: the landing of the one
+    /// before takes the marks, so it lands before the new one runs.
+    Marks,
+    /// No second mark could be made.
+    NoMark,
+}
+
+/// [`AHEAD`]'s slots: flights prepared while one was in the air, of them
+/// launched while it still was, then one per [`Early`].
+const AHEAD_SLOTS: usize = 2 + Early::NoMark as usize + 1;
+
+/// Counts since the last frame report ([`AHEAD_SLOTS`]).
+static AHEAD: [AtomicU64; AHEAD_SLOTS] = [const { AtomicU64::new(0) }; AHEAD_SLOTS];
+
+thread_local! {
+    /// While this thread prepares a flight behind one in the air: the host
+    /// and its submission counter (behind the `Host::submitted` lock this
+    /// thread holds), for [`land_ahead`].
+    static PREPARING_AHEAD: std::cell::Cell<Option<(*const Host, *mut u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Lands the flights in the air first if this thread prepares one behind
+/// them and `why` needs the GPU done with them; nothing otherwise.
+pub(crate) fn land_ahead(why: Early) {
+    let Some((host, submitted)) = PREPARING_AHEAD.with(std::cell::Cell::get) else {
+        return;
+    };
+    // SAFETY: set by `execute_flight1` around its preparation, on this
+    // thread, which holds the lock `submitted` is behind and does not
+    // otherwise touch it until it clears the cell.
+    let (host, submitted) = unsafe { (&*host, &mut *submitted) };
+    if host.has_in_flight() {
+        AHEAD[2 + why as usize].fetch_add(1, Ordering::Relaxed);
+        PREPARING_AHEAD.with(|c| c.set(None));
+        host.finish_flight_locked(submitted, None, None);
+    }
+}
+
+/// Whether a submission may be prepared while the one before it is in
+/// flight (`VICTORY_PREP_AHEAD=1`, with Flight-1; off by default).
+///
+/// It is when the flight in the air is quiet at landing
+/// ([`HostList::quiet_at_landing`]): its landing then changes nothing the
+/// preparation reads. The preparation refreshes host copies in place while
+/// that flight's shaders read them: as on the console, the title does not
+/// change memory submitted work reads until that work's fence moves, which
+/// is at its landing, so a refresh rewrites what the flight reads with the
+/// same bytes. Whatever else needs the GPU done with it lands it first
+/// ([`land_ahead`], [`Early`]): the frame's eviction, a view remake, the
+/// shared barrier lists, a heap fill, title copies (done on the CPU here,
+/// on the console by the GPU after the flight), and, before launching, the
+/// new flight's write marks (the landing takes the marks bitmaps whole).
+pub(crate) fn prep_ahead_enabled() -> bool {
+    #[cfg(test)]
+    match TEST_PREP_AHEAD.load(Ordering::Acquire) {
+        1 => return false,
+        2 => return flight1_enabled(),
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = flight1_enabled() && std::env::var_os("VICTORY_PREP_AHEAD").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "host submissions prepared while the one before is in flight (VICTORY_PREP_AHEAD=1)"
+            );
+        }
+        on
+    })
+}
+
 /// The frame report's line for asynchronous submission, per frame over
 /// `frames` frames: nothing unless a flight was launched.
 pub(crate) fn log_frame(frames: f64) {
     let (flights, us) = take_flight_times();
     let worker = crate::queue::take_worker_us();
+    let ahead = AHEAD.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
     if flights == 0 {
         return;
     }
@@ -219,6 +324,25 @@ pub(crate) fn log_frame(frames: f64) {
         ms(worker),
         unasked + idle_preparing,
     );
+    if prep_ahead_enabled() {
+        let per = |n: u64| n as f64 / frames;
+        tracing::info!(
+            "host submissions prepared while the last was in flight per frame: {:.1}, launched while it still \
+             was {:.1}; landed it first for: not quiet at landing {:.1}, eviction {:.1}, view remake {:.1}, \
+             barrier lists {:.1}, heap fill {:.1}, title copies {:.1}, marks of the new one {:.1}, no second \
+             mark {:.1}",
+            per(ahead[0]),
+            per(ahead[1]),
+            per(ahead[2]),
+            per(ahead[3]),
+            per(ahead[4]),
+            per(ahead[5]),
+            per(ahead[6]),
+            per(ahead[7]),
+            per(ahead[8]),
+            per(ahead[9]),
+        );
+    }
 }
 
 struct InFlight {
@@ -232,6 +356,11 @@ struct InFlight {
     prepared: std::time::Instant,
     launched: std::time::Instant,
     waited: bool,
+    /// Whether its landing changes nothing a later preparation reads: no
+    /// uploads of its own, and every list quiet at landing.
+    quiet: bool,
+    /// Title fences attached behind it.
+    signals: Vec<(usize, u64)>,
 }
 
 // SAFETY: Every field is `Send` (D3D12 objects are free-threaded; `HostList`
@@ -240,9 +369,11 @@ struct InFlight {
 unsafe impl Send for InFlight {}
 
 impl Host {
-    /// Runs `segments` with Wait-Before-Prep Flight-1 overlap when enabled:
-    /// finishes any prior flight first, prepares and launches `segments` on
-    /// the host queue, and returns immediately while the GPU executes.
+    /// Runs `segments` with Flight-1 overlap when enabled: prepares and
+    /// launches them on the host queue and returns while the GPU executes.
+    /// Wait-Before-Prep: the flight in the air lands first, unless
+    /// `VICTORY_PREP_AHEAD=1` lets this one be prepared behind it
+    /// ([`prep_ahead_enabled`]), at most two in flight.
     /// Falls back to synchronous execution when Flight-1 is disabled or when
     /// per-submission diagnostics tracing is active on this frame.
     pub(crate) fn execute_flight1(&self, segments: Vec<Arc<HostList>>, barrier_before: Vec<bool>) {
@@ -261,20 +392,61 @@ impl Host {
         let asked = std::time::Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        // Wait-Before-Prep: drain Flight N-1 completely before Flight N
-        // touches any shared Shadow, descriptor heap, upload staging pool, or
-        // Mark buffer.
-        self.finish_flight_locked(&mut submitted, None, None);
+        let ahead = prep_ahead_enabled();
+        if ahead {
+            // At most two in flight: the older of two lands first.
+            let front = {
+                let state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+                (state.flights.len() >= 2).then(|| state.flights[0].fence_value)
+            };
+            if let Some(v) = front {
+                self.finish_flight_locked(&mut submitted, Some(v), None);
+            }
+        }
+        let behind = ahead && {
+            let state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+            state.flights.len() == 1 && state.flights[0].quiet
+        };
+        if !behind {
+            if ahead && self.has_in_flight() {
+                AHEAD[2 + Early::NotQuiet as usize].fetch_add(1, Ordering::Relaxed);
+            }
+            // Wait-Before-Prep: drain Flight N-1 completely before Flight N
+            // touches any shared Shadow, descriptor heap, upload staging
+            // pool, or Mark buffer.
+            self.finish_flight_locked(&mut submitted, None, None);
+        }
         let landed = std::time::Instant::now();
 
+        let next = *submitted;
+        if behind {
+            AHEAD[0].fetch_add(1, Ordering::Relaxed);
+            let counter: *mut u64 = &mut *submitted;
+            PREPARING_AHEAD.with(|c| c.set(Some((self as *const Host, counter))));
+        }
         let prep = {
             let run_refs: Vec<&HostList> = segments.iter().map(|s| &**s).collect();
-            self.prepare_submission(&submitted, &run_refs, &barrier_before, false)
+            self.prepare_submission(next, &run_refs, &barrier_before, false)
         };
+        // Still behind a flight in the air: it lands before this one runs if
+        // this one marks its writes, or if there is no second mark.
+        if behind && segments.iter().any(|s| s.marks_writes()) {
+            land_ahead(Early::Marks);
+        }
+        if behind && self.has_in_flight() && self.mark_for(next + 1).is_none() {
+            land_ahead(Early::NoMark);
+        }
+        PREPARING_AHEAD.with(|c| c.set(None));
+        let still_behind = behind && self.has_in_flight();
+        if still_behind {
+            AHEAD[1].fetch_add(1, Ordering::Relaxed);
+        }
 
         let mut native_boundaries = prep.native_boundaries;
-        let mark = self.mark();
-        if mark.is_none() {
+        let fence_value = *submitted + 1;
+        let mark = self.mark_for(fence_value);
+        // Split marks are shared: kept together behind a flight in the air.
+        if mark.is_none() || still_behind {
             native_boundaries.clear();
         }
         let mut split_pool = (!native_boundaries.is_empty())
@@ -302,7 +474,7 @@ impl Host {
             .unwrap_or(&[]);
 
         *submitted += 1;
-        let fence_value = *submitted;
+        debug_assert_eq!(*submitted, fence_value);
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::SUBMITTED, fence_value, 0);
 
@@ -347,6 +519,7 @@ impl Host {
         add_step(Step::Launching, sent - launched);
         FLIGHTS.fetch_add(1, Ordering::Relaxed);
 
+        let quiet = prep.uploads.is_none() && segments.iter().all(|s| s.quiet_at_landing());
         let split_count = native_boundaries.len();
         let flight = InFlight {
             fence_value,
@@ -359,17 +532,18 @@ impl Host {
             prepared: prep.prepared,
             launched,
             waited,
+            quiet,
+            signals: Vec::new(),
         };
         {
             let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
-            debug_assert!(!state.active && state.in_flight.is_none());
+            debug_assert!(state.flights.len() < 2 && (state.flights.is_empty() || still_behind));
             if let Some(free) = state.free_since.take() {
                 let (unasked, preparing) = idle_split(free, asked, launched);
                 add_step(Step::IdleUnasked, unasked);
                 add_step(Step::IdlePreparing, preparing);
             }
-            state.active = true;
-            state.in_flight = Some(flight);
+            state.flights.push_back(flight);
             if !state.worker_started {
                 state.worker_started = true;
                 spawn_flight_worker();
@@ -392,21 +566,24 @@ impl Host {
         segments.into_iter().for_each(crate::list::recycle);
     }
 
-    /// Attaches a title fence signal behind the active flight if one is in the
-    /// air. Returns `true` if attached (the caller must NOT call `fence::set`
-    /// immediately), or `false` if no flight is active.
+    /// Attaches a title fence signal behind the newest flight in the air (or
+    /// the one landing). Returns `true` if attached (the caller must NOT call
+    /// `fence::set` immediately), or `false` if no flight is active.
     ///
     /// If `already_kept` is `false`, this calls `fence::keep(fence)` before
     /// storing it.
     pub(crate) fn attach_signal(&self, fence: This, value: u64, already_kept: bool) -> bool {
         let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.active {
+        if state.flights.is_empty() && !state.landing {
             return false;
         }
         if !already_kept {
             crate::fence::keep(fence);
         }
-        state.pending_signals.push((fence as usize, value));
+        match state.flights.back_mut() {
+            Some(newest) => newest.signals.push((fence as usize, value)),
+            None => state.landing_signals.push((fence as usize, value)),
+        }
         true
     }
 
@@ -418,11 +595,12 @@ impl Host {
 
     /// Whether a flight is currently in the air or landing.
     pub(crate) fn has_in_flight(&self) -> bool {
-        self.flight.lock().unwrap_or_else(|e| e.into_inner()).active
+        let state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+        !state.flights.is_empty() || state.landing
     }
 
-    /// Waits for and lands any active flight now. Returns `true` if a flight
-    /// was landed by this call.
+    /// Waits for and lands every flight in the air now. Returns `true` if a
+    /// flight was landed by this call.
     pub(crate) fn finish_flight_now(&self) -> bool {
         if !self.has_in_flight() {
             return false;
@@ -432,31 +610,48 @@ impl Host {
         self.finish_flight_locked(&mut submitted, None, None)
     }
 
-    /// Completes any active flight under `Host::submitted`. When
-    /// `only_if_fence` is `Some(v)`, only lands if the active flight matches
-    /// fence value `v` (used by `victory-flight` so it never blocks on a newer
-    /// flight while holding `Host::submitted`). `waited_at`, when provided by
-    /// `victory-flight`, records the exact instant the GPU fence completed so
-    /// lock-wait latency is never billed as GPU execution time.
+    /// Lands flights under `Host::submitted`, oldest first. When
+    /// `only_if_fence` is `Some(v)`, lands only the oldest, and only if its
+    /// fence value is `v` (used by `victory-flight` so it never blocks on a
+    /// newer flight while holding `Host::submitted`); else every one.
+    /// `waited_at`, when provided by `victory-flight`, records the exact
+    /// instant the GPU fence completed so lock-wait latency is never billed
+    /// as GPU execution time.
     pub(super) fn finish_flight_locked(
         &self,
         submitted: &mut u64,
         only_if_fence: Option<u64>,
         waited_at: Option<std::time::Instant>,
     ) -> bool {
-        let flight = {
-            let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
-            match state.in_flight.as_ref() {
-                Some(f) if only_if_fence.is_none_or(|v| f.fence_value == v) => {
-                    state.in_flight.take()
+        let mut landed_any = false;
+        loop {
+            let flight = {
+                let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+                match state.flights.front() {
+                    Some(f) if only_if_fence.is_none_or(|v| f.fence_value == v) => {
+                        let flight = state.flights.pop_front();
+                        if let Some(f) = &flight {
+                            state.landing = true;
+                            state.landing_signals = f.signals.clone();
+                        }
+                        flight
+                    }
+                    _ => None,
                 }
-                _ => return false,
+            };
+            let Some(flight) = flight else {
+                return landed_any;
+            };
+            self.land(submitted, flight, waited_at.filter(|_| !landed_any));
+            landed_any = true;
+            if only_if_fence.is_some() {
+                return true;
             }
-        };
-        let Some(flight) = flight else {
-            return false;
-        };
+        }
+    }
 
+    /// Lands `flight`, taken from the front of `Host::flight`'s flights.
+    fn land(&self, submitted: &mut u64, flight: InFlight, waited_at: Option<std::time::Instant>) {
         let gpu_done = if flight.waited {
             // SAFETY: plain fence completion query.
             if unsafe { self.fence.GetCompletedValue() } < flight.fence_value {
@@ -471,9 +666,15 @@ impl Host {
         let gpu_duration = gpu_done.saturating_duration_since(flight.launched);
         #[cfg(test)]
         super::tests::native_call_group(flight.waited);
-        self.flight.lock().unwrap_or_else(|e| e.into_inner()).free_since = Some(gpu_done);
+        {
+            let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+            // With a newer flight in the air the GPU is not free.
+            if state.flights.is_empty() {
+                state.free_since = Some(gpu_done);
+            }
+        }
 
-        let mark = self.mark();
+        let mark = self.mark_for(flight.fence_value);
         let split_failed = if flight.split_count > 0 {
             let pool = self.split_marks.lock().unwrap_or_else(|e| e.into_inner());
             pool.as_deref().is_some_and(|marks| {
@@ -491,11 +692,22 @@ impl Host {
             // SAFETY: a plain query.
             && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
         {
+            // A newer flight in the air ran on the same queue: done with it
+            // first, as the probe that follows submits behind it.
+            let newest = {
+                let state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+                state.flights.back().map(|f| f.fence_value)
+            };
+            if let Some(v) = newest {
+                self.wait_for(v);
+            }
             self.lost(submitted, mark);
         }
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::RAN, flight.fence_value, 0);
-        let done = *submitted;
+        // This flight's fence, not the newest submission's: another may still
+        // be in the air (`VICTORY_PREP_AHEAD=1`).
+        let done = flight.fence_value;
         super::SUBMISSIONS_DONE.store(done, Ordering::Release);
         // The GPU fence has completed: return worker-owned staging chunks now
         // at the same point as the synchronous path.
@@ -528,18 +740,21 @@ impl Host {
         drop(flight.uploads);
         flight.segments.into_iter().for_each(crate::list::recycle);
 
-        // Deliver every title fence signal queued behind this flight
-        // atomically before clearing `active`, so later `queue::signal` calls
-        // can never overtake an attached signal.
+        // Deliver every title fence signal queued behind this flight before
+        // it stops landing, so later `queue::signal` calls can never overtake
+        // an attached signal.
         let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
-        for (fence, value) in state.pending_signals.drain(..) {
+        for (fence, value) in state.landing_signals.drain(..) {
             crate::fence::set(fence as This, value);
             crate::fence::let_go(fence as This);
         }
-        state.active = false;
-        true
+        state.landing = false;
     }
 }
+
+#[cfg(test)]
+pub(super) static TEST_PAUSE_LANDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn spawn_flight_worker() {
     let _ = std::thread::Builder::new()
@@ -551,13 +766,13 @@ fn spawn_flight_worker() {
             loop {
                 let (fence_value, waited) = {
                     let mut state = host.flight.lock().unwrap_or_else(|e| e.into_inner());
-                    while state.in_flight.is_none() {
+                    while state.flights.is_empty() {
                         state = host
                             .flight_wake
                             .wait(state)
                             .unwrap_or_else(|e| e.into_inner());
                     }
-                    let f = state.in_flight.as_ref().expect("in_flight present");
+                    let f = state.flights.front().expect("a flight in the air");
                     (f.fence_value, f.waited)
                 };
                 // Wait on the GPU fence WITHOUT holding `HELD` or
@@ -566,14 +781,18 @@ fn spawn_flight_worker() {
                     host.wait_for_on_event(host.flight_event, fence_value, 250);
                 }
                 let gpu_done = std::time::Instant::now();
-                // Skip acquiring `Host::submitted` if `victory-submit` already
+                #[cfg(test)]
+                while TEST_PAUSE_LANDING.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // Skip acquiring `Host::submitted` if another thread already
                 // claimed and began landing this flight while we waited.
                 let still_mine = host
                     .flight
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .in_flight
-                    .as_ref()
+                    .flights
+                    .front()
                     .is_some_and(|f| f.fence_value == fence_value);
                 if !still_mine {
                     continue;
@@ -1140,6 +1359,229 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert!(start.elapsed() < Duration::from_secs(5), "the waiting queue's work did not run");
             std::thread::yield_now();
         }
+    }
+
+    fn flights_in_air(host: &Host) -> usize {
+        host.flight.lock().unwrap().flights.len()
+    }
+
+    fn ahead_counts() -> [u64; AHEAD_SLOTS] {
+        AHEAD.each_ref().map(|a| a.load(Ordering::Relaxed))
+    }
+
+    /// A closed host list that copies `value` into the first word of `out`
+    /// (a mapped buffer): it writes nothing that goes back to title memory.
+    fn quiet_copy(
+        host: &Host,
+        value: u32,
+        out: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    ) -> Arc<HostList> {
+        let (src, src_ptr) = host.upload_buffer(64).expect("upload buffer");
+        // SAFETY: mapped 64-byte upload buffer.
+        unsafe { src_ptr.cast::<u32>().write_volatile(value) };
+        let seg = Arc::new(host.new_list().expect("host list"));
+        // SAFETY: open host list, valid buffers.
+        unsafe { seg.list.CopyBufferRegion(out, 0, &src, 0, 4) };
+        seg.keep(&src);
+        seg.keep(out);
+        seg.close();
+        seg
+    }
+
+    /// With `VICTORY_PREP_AHEAD=1` a submission behind a quiet flight (one
+    /// whose landing writes nothing back) is prepared while it is in the air
+    /// and launched behind it: two in flight. Both run, the newer one's
+    /// refresh reads what the title wrote, and their fences move in order.
+    #[test]
+    fn prep_ahead_launches_behind_a_quiet_flight_and_lands_in_order() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        // The frame's eviction pass is done: it would land the flight first.
+        crate::resource::evict_unused();
+        let (_q, f1) = make_queue_and_fence();
+        let (_q2, f2) = make_queue_and_fence();
+        let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+        // SAFETY: valid layout; freed at the end.
+        let title_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let title_addr = title_ptr as u64;
+        let shadow = crate::shadow::find(title_addr, 4096).expect("shadow");
+        let (out1, out1_ptr) = host.mapped_buffer(64, true).expect("out1");
+        let (out2, out2_ptr) = host.mapped_buffer(64, true).expect("out2");
+        let mut bop: u64 = 0;
+        let before = ahead_counts();
+
+        TEST_PAUSE_LANDING.store(true, Ordering::Release);
+        host.execute_flight1(vec![quiet_copy(host, 0x1111_0001, &out1)], vec![]);
+        assert!(host.attach_signal(f1, 1, false));
+        assert_eq!(flights_in_air(host), 1);
+
+        // SAFETY: valid title buffer.
+        unsafe { title_ptr.cast::<u32>().write_volatile(0x2222_0002) };
+        let seg2 = Arc::new(host.new_list().expect("seg2"));
+        shadow.refresh(&seg2, title_addr, 64);
+        // SAFETY: open list, valid buffers.
+        unsafe { seg2.list.CopyBufferRegion(&out2, 0, &shadow.buffer, shadow.offset(title_addr), 4) };
+        seg2.keep(&out2);
+        seg2.defer_write((&raw mut bop).cast(), Written::Value(7), 8);
+        seg2.close();
+        host.execute_flight1(vec![seg2], vec![]);
+        assert!(host.attach_signal(f2, 1, false));
+
+        let after = ahead_counts();
+        assert_eq!(after[0] - before[0], 1, "prepared while the first was in the air");
+        // Launched behind it, unless a pass another test asked for (an
+        // eviction or a view remake) landed it first.
+        let launched_behind = after[1] - before[1];
+        let landed_for_others = (after[2 + Early::Eviction as usize] - before[2 + Early::Eviction as usize])
+            + (after[2 + Early::Remake as usize] - before[2 + Early::Remake as usize]);
+        assert_eq!(launched_behind + landed_for_others, 1);
+        if launched_behind == 1 {
+            assert_eq!(flights_in_air(host), 2, "two in flight");
+        }
+
+        TEST_PAUSE_LANDING.store(false, Ordering::Release);
+        let start = Instant::now();
+        loop {
+            let (b, a) = (crate::fence::value(f2), crate::fence::value(f1));
+            if b >= 1 {
+                assert_eq!(a, 1, "the newer flight's fence moved before the older one's");
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "the flights did not land");
+            std::thread::yield_now();
+        }
+        // SAFETY: both flights have landed.
+        unsafe {
+            assert_eq!(out1_ptr.cast::<u32>().read_volatile(), 0x1111_0001);
+            assert_eq!(out2_ptr.cast::<u32>().read_volatile(), 0x2222_0002);
+            assert_eq!((&raw const bop).read_volatile(), 7);
+        }
+        assert!(!host.has_in_flight());
+        drop(shadow);
+        // SAFETY: all flights landed.
+        unsafe { std::alloc::dealloc(title_ptr, layout) };
+    }
+
+    /// The hazard prep-ahead must not cross: a flight in the air whose
+    /// shaders write a host copy, which goes back to title memory when it
+    /// lands. A submission refreshing that copy is prepared only after the
+    /// flight landed, so it reads the bytes the GPU wrote (now in title
+    /// memory), not stale ones over them.
+    #[test]
+    fn prep_ahead_lands_a_flight_with_copy_back_before_preparing() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+        // SAFETY: valid layout; freed at the end.
+        let title_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let title_addr = title_ptr as u64;
+        let shadow = crate::shadow::find(title_addr, 4096).expect("shadow");
+        let (src, src_ptr) = host.upload_buffer(64).expect("upload buffer");
+        // SAFETY: mapped 64-byte upload buffer.
+        unsafe { src_ptr.cast::<u32>().write_volatile(0xCAFE_BABE) };
+        let (out2, out2_ptr) = host.mapped_buffer(64, true).expect("out2");
+        let before = ahead_counts();
+
+        TEST_PAUSE_LANDING.store(true, Ordering::Release);
+        let seg1 = Arc::new(host.new_list().expect("seg1"));
+        // SAFETY: open host list, valid D3D12 buffers.
+        unsafe { seg1.list.CopyBufferRegion(&shadow.buffer, shadow.offset(title_addr), &src, 0, 4) };
+        seg1.keep(&src);
+        shadow.gpu_writes(&seg1, title_addr, 4, false);
+        seg1.close();
+        assert!(!seg1.quiet_at_landing());
+        host.execute_flight1(vec![seg1], vec![]);
+
+        let seg2 = Arc::new(host.new_list().expect("seg2"));
+        shadow.refresh(&seg2, title_addr, 64);
+        // SAFETY: open list, valid buffers.
+        unsafe { seg2.list.CopyBufferRegion(&out2, 0, &shadow.buffer, shadow.offset(title_addr), 4) };
+        seg2.keep(&out2);
+        seg2.close();
+        host.execute_flight1(vec![seg2], vec![]);
+        let after = ahead_counts();
+        assert_eq!(after[0], before[0], "prepared behind a flight that writes back");
+        assert_eq!(after[2 + Early::NotQuiet as usize] - before[2 + Early::NotQuiet as usize], 1);
+
+        TEST_PAUSE_LANDING.store(false, Ordering::Release);
+        host.finish_flight_now();
+        // SAFETY: both flights have landed.
+        unsafe {
+            assert_eq!(title_ptr.cast::<u32>().read_volatile(), 0xCAFE_BABE, "the GPU's write went back");
+            assert_eq!(out2_ptr.cast::<u32>().read_volatile(), 0xCAFE_BABE, "the refresh overwrote it");
+        }
+        drop(shadow);
+        // SAFETY: all flights landed.
+        unsafe { std::alloc::dealloc(title_ptr, layout) };
+    }
+
+    /// A submission whose shaders mark their writes is prepared behind a
+    /// quiet flight, but that flight lands before it launches: its landing
+    /// takes the write marks, which would be the new one's.
+    #[test]
+    fn prep_ahead_lands_before_launching_a_flight_that_marks_writes() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        crate::resource::evict_unused();
+        let (out1, _) = host.mapped_buffer(64, true).expect("out1");
+        let (out2, out2_ptr) = host.mapped_buffer(64, true).expect("out2");
+        let before = ahead_counts();
+
+        TEST_PAUSE_LANDING.store(true, Ordering::Release);
+        host.execute_flight1(vec![quiet_copy(host, 1, &out1)], vec![]);
+        let seg2 = quiet_copy(host, 0x3333_0003, &out2);
+        seg2.note_unknown_gpu_write();
+        assert!(seg2.marks_writes() && !seg2.quiet_at_landing());
+        host.execute_flight1(vec![seg2], vec![]);
+        let after = ahead_counts();
+        let early = |e: Early| after[2 + e as usize] - before[2 + e as usize];
+        assert_eq!(after[0] - before[0], 1, "prepared while the first was in the air");
+        assert_eq!(after[1], before[1], "launched while the first was in the air");
+        assert_eq!(early(Early::Marks) + early(Early::Eviction) + early(Early::Remake), 1);
+        assert_eq!(flights_in_air(host), 1);
+
+        TEST_PAUSE_LANDING.store(false, Ordering::Release);
+        host.finish_flight_now();
+        // SAFETY: the flights have landed.
+        assert_eq!(unsafe { out2_ptr.cast::<u32>().read_volatile() }, 0x3333_0003);
+    }
+
+    /// A title copy in a submission is done on the CPU while it is
+    /// prepared, which on the console runs on the GPU after the work before
+    /// it: prepared behind a flight, the submission lands it first.
+    #[test]
+    fn prep_ahead_lands_before_a_title_copy() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::with_prep_ahead(true, false, true);
+        crate::resource::evict_unused();
+        let (out1, _) = host.mapped_buffer(64, true).expect("out1");
+        let from = [0x5eed_u64; 4];
+        let mut to = [0u64; 4];
+        let before = ahead_counts();
+
+        TEST_PAUSE_LANDING.store(true, Ordering::Release);
+        host.execute_flight1(vec![quiet_copy(host, 1, &out1)], vec![]);
+        let seg2 = Arc::new(host.new_list().expect("seg2"));
+        seg2.defer_copy(to.as_mut_ptr().cast(), from.as_ptr().cast(), 32);
+        seg2.close();
+        host.execute_flight1(vec![seg2], vec![]);
+        let after = ahead_counts();
+        let early = |e: Early| after[2 + e as usize] - before[2 + e as usize];
+        assert_eq!(after[0] - before[0], 1);
+        assert_eq!(early(Early::TitleCopy) + early(Early::Remake), 1, "landed first for the title copy");
+        assert_eq!(after[1], before[1]);
+
+        TEST_PAUSE_LANDING.store(false, Ordering::Release);
+        host.finish_flight_now();
+        assert_eq!(to, from);
     }
 
     /// The fence [`recording_mapper`] reads, and what it saw: each mapping's
