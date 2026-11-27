@@ -2677,6 +2677,64 @@ pub(crate) fn forget_range(at: usize, len: usize) {
     }
 }
 
+/// Every host copy holding any of title memory `[from, to)`: buffers, loose
+/// windows and exact copies (`crate::host::same_copy`).
+pub(crate) fn over(from: usize, to: usize) -> Vec<Arc<Shadow>> {
+    let (from, to) = (from as u64, to as u64);
+    let mut found: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let map = buffers_read();
+        let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
+        for (_, entry) in map.range((lowest, 0)..(to, 0)) {
+            if entry.end > from
+                && let Some(shadow) = &entry.shadow
+            {
+                found.push(shadow.clone());
+            }
+        }
+    }
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let lowest = from.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+        for (&(start, slen), shadow) in map.range((lowest, 0)..(to, 0)) {
+            if start.saturating_add(slen) > from {
+                found.push(shadow.clone());
+            }
+        }
+    }
+    {
+        let guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let lowest = from.saturating_sub(EXACT_SPAN.load(Ordering::Relaxed));
+        for (&(start, slen, _), weak) in guard.1.range((lowest, 0, 0)..(to, 0, 0)) {
+            if start.saturating_add(slen) > from
+                && let Some(shadow) = weak.upgrade()
+            {
+                found.push(shadow);
+            }
+        }
+    }
+    found
+}
+
+impl Shadow {
+    /// Whether the copy's bytes of title memory `[address, address +
+    /// bytes.len())`, where it holds them, are `bytes` (a zero-copy alias
+    /// is the title's memory itself).
+    pub(crate) fn holds(&self, address: usize, bytes: &[u8]) -> bool {
+        if self.aliased {
+            return true;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(bytes.len()).min(end));
+        if from >= to {
+            return true;
+        }
+        // SAFETY: inside the copy's mapping.
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+        host == &bytes[from - address..to - address]
+    }
+}
+
 /// Every host copy of title memory made so far (buffers, aliases, and windows).
 /// Presented frames a copy goes unasked for before [`release_idle`] may
 /// give it up.

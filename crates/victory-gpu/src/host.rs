@@ -5,6 +5,7 @@
 //! overlap them with per-submission fences once more than clears run.
 
 mod flight;
+pub(crate) mod same_copy;
 pub(crate) use flight::{async_submit_enabled, flight1_enabled, probe_marked};
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -289,6 +290,13 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+/// Of the preparing's copies (`PREPARING[0..2]`): title copies between
+/// buffers (count, microseconds, bytes), then fills of upload memory from
+/// title memory (the same), since the last frame-rate line. The rest of
+/// those copies are refreshes of host copies.
+static COPY_KINDS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Of the preparing, by phase ([`Phase`]), in microseconds since the last
 /// frame-rate line: where a submission's CPU time goes, so a frame report
@@ -4807,6 +4815,15 @@ impl HostList {
                 },
             );
             let copied = match step {
+                // `VICTORY_SAME_COPIES=skip`: a copy that changes nothing
+                // anywhere is left out (`same_copy`).
+                &Step::Copy(dst, src, len)
+                    if same_copy::mode() != same_copy::Mode::Off
+                        && same_copy::in_place(dst, src, len)
+                        && same_copy::mode() == same_copy::Mode::Skip =>
+                {
+                    0
+                }
                 &Step::Copy(dst, src, len) | &Step::Move(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -4896,6 +4913,10 @@ impl HostList {
                 let us = copy_started.elapsed().as_micros() as u64;
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                let kind = if matches!(step, Step::Fill(..)) { 3 } else { 0 };
+                COPY_KINDS[kind].fetch_add(1, Ordering::Relaxed);
+                COPY_KINDS[kind + 1].fetch_add(us, Ordering::Relaxed);
+                COPY_KINDS[kind + 2].fetch_add(copied as u64, Ordering::Relaxed);
             }
         }
     }
@@ -6124,6 +6145,34 @@ impl Meter {
                 .map(|(name, us)| format!("{name} {:.1}", ms(us)))
                 .collect();
             tracing::info!("host preparing per frame by phase, ms: {}", phases.join(", "));
+            {
+                let k = COPY_KINDS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                let per = |n: u64| n as f64 / report_frames;
+                let mb = |b: u64| b as f64 / 1e6 / report_frames;
+                let [compared, compared_bytes, same, same_bytes, comparing] = same_copy::take();
+                // The refreshes are the rest of the copies' line (both
+                // counters were taken above, as ms and MB per frame).
+                let refresh_ms = (copy_ms - ms(k[1] + k[4])).max(0.0);
+                let refresh_mb = (copy_mb - mb(k[2] + k[5])).max(0.0);
+                tracing::info!(
+                    "host preparing copies per frame: title copies {:.1} ({:.1} MB, {:.1} ms), fills of upload \
+                     memory {:.1} ({:.1} MB, {:.1} ms), refreshes of host copies {refresh_mb:.1} MB \
+                     {refresh_ms:.1} ms; title copies compared {:.1} ({:.1} MB, {:.1} ms), already in place \
+                     {:.1} ({:.1} MB){}",
+                    per(k[0]),
+                    mb(k[2]),
+                    ms(k[1]),
+                    per(k[3]),
+                    mb(k[5]),
+                    ms(k[4]),
+                    per(compared),
+                    mb(compared_bytes),
+                    ms(comparing),
+                    per(same),
+                    mb(same_bytes),
+                    if same_copy::mode() == same_copy::Mode::Skip { ", left out" } else { "" },
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
@@ -7141,6 +7190,117 @@ mod batch {
     fn title_copy(batch: &mut Batch, dst: usize, src: usize, len: usize) {
         batch.title_copied(dst, len);
         super::copy_mapped(dst as *mut u8, src as *const u8, len, true);
+    }
+
+    /// Runs a list holding one title copy of `len` bytes from `src` to
+    /// `dst` with `VICTORY_SAME_COPIES` as `mode` on this thread (1 probe,
+    /// 2 skip).
+    fn copy_with(batch: &mut Batch, mode: u8, dst: usize, src: usize, len: usize) {
+        let list = super::host().unwrap().new_list().unwrap();
+        list.defer_copy(dst as *mut u8, src as *const u8, len);
+        super::same_copy::TEST_MODE.with(|m| m.set(mode));
+        list.run_deferred(batch);
+        super::same_copy::TEST_MODE.with(|m| m.set(0));
+    }
+
+    /// `VICTORY_SAME_COPIES=skip`: a title copy whose bytes the destination
+    /// and its host copy hold already is left out, so the copy stays
+    /// current and nothing is refreshed again; with `probe` it still runs.
+    #[test]
+    fn a_title_copy_of_bytes_in_place_is_left_out() {
+        let Some((p, a)) = plain(2) else {
+            return; // no host GPU here
+        };
+        fill(p, 2 * PAGE, 0x5a);
+        let mut batch = Batch::default();
+        batch.add(&a, p, 2 * PAGE);
+        assert_eq!(batch.flush(), 2 * PAGE, "the host copy takes the title's bytes");
+
+        copy_with(&mut batch, 2, p + PAGE, p, 256);
+        batch.add(&a, p, 2 * PAGE);
+        assert_eq!(batch.flush(), 0, "left out: the copy is still current");
+
+        copy_with(&mut batch, 1, p + PAGE, p, 256);
+        batch.add(&a, p, 2 * PAGE);
+        assert!(batch.flush() > 0, "probe: the copy ran and its destination is due again");
+        done(p, Some(a));
+    }
+
+    /// What comparing a title copy costs against running it, under Wine:
+    /// `cargo test --release -p victory-gpu --lib same_copy_costs --
+    /// --ignored --nocapture` (through `tools/macos/test-wine.sh`).
+    #[test]
+    #[ignore = "times title copies against comparing them"]
+    fn same_copy_costs() {
+        let pages = 2 * (8 << 20) / PAGE;
+        let Some((p, a)) = plain(pages) else {
+            return; // no host GPU here
+        };
+        let half = pages / 2 * PAGE;
+        fill(p, 2 * half, 0x5a);
+        let mut batch = Batch::default();
+        batch.add(&a, p, 2 * half);
+        batch.flush();
+        for len in [4 << 10, 64 << 10, 1 << 20, 8 << 20] {
+            let rounds = (256 << 20) / len;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                super::copy_mapped((p + half) as *mut u8, p as *const u8, len, true);
+            }
+            let copy = started.elapsed().as_secs_f64() / rounds as f64;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                assert!(super::same_copy::in_place(p + half, p, len));
+            }
+            let compare = started.elapsed().as_secs_f64() / rounds as f64;
+            println!(
+                "{:>5} KiB: copy {:.1} us ({:.1} GB/s), compare {:.1} us ({:.1} GB/s)",
+                len >> 10,
+                copy * 1e6,
+                len as f64 / copy / 1e9,
+                compare * 1e6,
+                len as f64 / compare / 1e9
+            );
+        }
+        done(p, Some(a));
+    }
+
+    /// A title copy that changes the destination, or whose destination's
+    /// host copy holds other bytes than the title's, runs with `skip` too.
+    #[test]
+    fn a_title_copy_that_changes_anything_still_runs() {
+        let Some((p, a)) = plain(2) else {
+            return; // no host GPU here
+        };
+        fill(p, 2 * PAGE, 0x5a);
+        let mut batch = Batch::default();
+        batch.add(&a, p, 2 * PAGE);
+        batch.flush();
+
+        // Other bytes at the source.
+        fill(p, 256, 0x11);
+        copy_with(&mut batch, 2, p + PAGE, p, 256);
+        // SAFETY: committed title memory.
+        assert_eq!(unsafe { *((p + PAGE) as *const u8) }, 0x11, "the copy ran");
+        batch.add(&a, p, 2 * PAGE);
+        assert!(batch.flush() > 0);
+        assert_eq!(a.read_host((p + PAGE) as u64, 1)[0], 0x1111_1111);
+
+        // The title's source and destination agree, but the host copy holds
+        // other bytes there that nothing makes due (what shaders wrote and
+        // kept in the copy): the copy runs, as on the console it would
+        // overwrite them, and the refresh it makes due puts the source's
+        // bytes into the host copy.
+        fill(p, 256, 0x77);
+        fill(p + PAGE, 256, 0x77);
+        batch.add(&a, p, 2 * PAGE);
+        batch.flush();
+        a.write_host((p + PAGE) as u64, &[0xee; 256]);
+        copy_with(&mut batch, 2, p + PAGE, p, 256);
+        batch.add(&a, p, 2 * PAGE);
+        assert!(batch.flush() > 0, "the copy made its destination due again");
+        assert_eq!(a.read_host((p + PAGE) as u64, 1)[0], 0x7777_7777);
+        done(p, Some(a));
     }
 
     #[test]
