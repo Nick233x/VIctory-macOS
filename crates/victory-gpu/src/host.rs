@@ -3465,15 +3465,16 @@ impl HostList {
         depth: &std::sync::Arc<crate::resource::HostTexture>,
         side: u8,
         writes: bool,
+        whole: bool,
     ) -> Option<bool> {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(crate::twin::Use::new(depth, side, writes));
+                v.insert(crate::twin::Use::new(depth, side, writes, whole));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let copy = o.get_mut().again(side, writes);
+                let copy = o.get_mut().again(side, writes, whole);
                 if copy.is_some() || writes {
                     self.changed_something();
                 }
@@ -5866,6 +5867,7 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            crate::twin::log(report_frames);
             crate::draw::table_memo_line(report_frames);
             // How long the threads that ran held work were held by it: a
             // title thread waits there instead of going on with its frame.

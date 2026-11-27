@@ -1312,7 +1312,13 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
-        ensure_state(list, record.resource, DEPTH_WRITE);
+        // Without rectangles a clear of every plane needs none of the older
+        // contents (`crate::twin`: a newer twin need not be copied in).
+        if rects.is_none() {
+            crate::twin::overwriting(flags, || ensure_state(list, record.resource, DEPTH_WRITE));
+        } else {
+            ensure_state(list, record.resource, DEPTH_WRITE);
+        }
         let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
