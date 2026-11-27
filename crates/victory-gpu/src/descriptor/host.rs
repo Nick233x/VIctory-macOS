@@ -643,6 +643,17 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Counts a [`HostHeap::mirror_synced_batch`] into `crate::descriptor::SYNC_STATS` when dropped.
+struct MakeTimer(std::time::Instant, u64);
+
+impl Drop for MakeTimer {
+    fn drop(&mut self) {
+        use crate::descriptor::{SyncStat, sync_stat};
+        sync_stat(SyncStat::MakeUs, self.0.elapsed().as_micros() as u64);
+        sync_stat(SyncStat::Made, self.1);
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1706,6 +1717,7 @@ impl HostHeap {
     /// deduplicating `prepare` and descriptor creation via [`StagingHeap`] +
     /// `CopyDescriptorsSimple`.
     fn mirror_synced_batch(&self, stale: &[(u32, [u32; 3])], at: impl Fn(u32) -> u64) {
+        let _making = MakeTimer(std::time::Instant::now(), stale.len() as u64);
         struct CachedTemplate {
             src: D3D12_CPU_DESCRIPTOR_HANDLE,
             kept: Option<Kept>,
@@ -5302,6 +5314,66 @@ mod tests {
         crate::object::release(buf_c);
         let _ = title_heap.as_mut_ptr();
         let _ = tex_mem.as_ptr();
+    }
+
+    /// What syncing a heap page the title rewrote with the same records
+    /// costs (every slot scanned, none stale), against comparing the page
+    /// with its bytes from the last sync. `cargo test --release -p
+    /// victory-gpu --lib bench_unchanged_page -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "times a sync of unchanged heap pages"]
+    fn bench_unchanged_page_scan_vs_compare() {
+        const SLOTS: u32 = 65_536;
+        const PAGE_SLOTS: u32 = 2_048;
+        let Some(host) = HostHeap::new(false, SLOTS) else {
+            return;
+        };
+        let srv_desc = [62u32, 1, 0x1688, 0, 0, 0, 256, 0, 0, 0];
+        let records: Vec<[u32; 3]> = (0..64)
+            .map(|_| {
+                let b = crate::resource::test_buffer(256);
+                let (ptr, len) = crate::resource::buffer_bytes(b).expect("buffer bytes");
+                crate::shadow::register(b as usize, ptr as u64, len);
+                let mut rec = [0u32; 3];
+                crate::descriptor::create_srv(std::ptr::null(), b, &srv_desc, rec.as_mut_ptr() as u64);
+                rec
+            })
+            .collect();
+        let mem = private_memory(SLOTS as usize * 32);
+        for i in 0..SLOTS as usize {
+            let rec = records[i % records.len()];
+            for (k, w) in rec.iter().enumerate() {
+                mem[i * 32 + 4 * k..i * 32 + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        let start = mem.as_ptr() as u64;
+        let sync = |host: &HostHeap| {
+            for p in 0..SLOTS / PAGE_SLOTS {
+                let (first, last) = (p * PAGE_SLOTS, (p + 1) * PAGE_SLOTS);
+                let (b0, b1) = (first as usize * 32, last as usize * 32);
+                host.sync_slots_bytes_with(first..last, start, 32, start + b0 as u64, &mem[b0..b1], true);
+            }
+        };
+        sync(&host);
+        let pages = (SLOTS / PAGE_SLOTS) as usize;
+        let rounds = 20;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            sync(&host);
+        }
+        let scan = started.elapsed().as_secs_f64() * 1e6 / (rounds * pages) as f64;
+        let saved = mem.to_vec();
+        let started = std::time::Instant::now();
+        let mut same = 0;
+        for _ in 0..rounds {
+            for p in 0..pages {
+                let r = p * 65_536..(p + 1) * 65_536;
+                same += usize::from(std::hint::black_box(&mem[r.clone()]) == &saved[r]);
+            }
+        }
+        let compare = started.elapsed().as_secs_f64() * 1e6 / (rounds * pages) as f64;
+        assert_eq!(same, rounds * pages);
+        eprintln!("unchanged 64 KiB heap page ({PAGE_SLOTS} slots): scan {scan:.1} us, compare {compare:.1} us");
     }
 
     #[test]

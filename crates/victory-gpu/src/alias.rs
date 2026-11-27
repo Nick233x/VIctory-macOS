@@ -472,6 +472,54 @@ pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
     }
 }
 
+/// Why the runtime did not alias memory it committed for the title
+/// ([`note_unaliased`]): the frame report counts the bytes by reason, so a
+/// run shows which memory host copies are refreshed from.
+#[derive(Clone, Copy, Debug)]
+pub enum Unaliased {
+    /// Aliasing is off on this host.
+    Off,
+    /// Not read-write memory (write-combined, read-only, no access).
+    Protection,
+    /// A placeholder, for physical pages mapped later.
+    Placeholder,
+    /// Not whole 64 KiB pages.
+    Unaligned,
+    /// The remap itself failed or overlapped an alias.
+    Failed,
+}
+
+const UNALIASED_REASONS: [&str; 5] = ["aliasing off", "protection", "placeholder", "not whole pages", "remap failed"];
+
+/// Bytes committed for the title and not aliased, by [`Unaliased`], since
+/// the last frame report, and over the run.
+static UNALIASED: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// The runtime committed `len` bytes for the title without aliasing them.
+pub fn note_unaliased(len: usize, why: Unaliased) {
+    use std::sync::atomic::Ordering::Relaxed;
+    UNALIASED[why as usize].fetch_add(len as u64, Relaxed);
+    UNALIASED[5 + why as usize].fetch_add(len as u64, Relaxed);
+}
+
+/// The frame report's line: what was committed and not aliased, by reason,
+/// over the run (MB), and how much of it since the last report.
+pub(crate) fn log_unaliased() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now: Vec<u64> = (0..5).map(|i| UNALIASED[i].swap(0, Relaxed)).collect();
+    let run: Vec<u64> = (5..10).map(|i| UNALIASED[i].load(Relaxed)).collect();
+    if run.iter().all(|&b| b == 0) {
+        return;
+    }
+    let parts: Vec<String> = UNALIASED_REASONS
+        .iter()
+        .zip(run.iter().zip(&now))
+        .filter(|(_, (run, _))| **run != 0)
+        .map(|(why, (run, now))| format!("{why} {:.0} MB (+{:.0})", *run as f64 / 1e6, *now as f64 / 1e6))
+        .collect();
+    tracing::info!("title memory committed without zero-copy aliasing, over the run: {}", parts.join(", "));
+}
+
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU
 /// and GPU share physical pages with zero copy.
 pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {

@@ -2677,6 +2677,72 @@ pub(crate) fn forget_range(at: usize, len: usize) {
     }
 }
 
+/// Bytes and microseconds each host copy's refreshes took since the last
+/// frame report, by copy: where it is, how long, whether its memory is
+/// tracked (else copied whole each time).
+type RefreshedBy = std::collections::HashMap<usize, (u64, u64, bool, u64, u64)>;
+static REFRESHED: Mutex<Option<RefreshedBy>> = Mutex::new(None);
+
+/// A refresh of `copy` copied `bytes` in `us` microseconds.
+pub(crate) fn note_refreshed(copy: &Arc<Shadow>, bytes: usize, us: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let mut map = REFRESHED.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map
+        .get_or_insert_with(Default::default)
+        .entry(Arc::as_ptr(copy) as usize)
+        .or_insert((copy.start, copy.len, copy.tracked.is_some(), 0, 0));
+    entry.3 += bytes as u64;
+    entry.4 += us;
+}
+
+/// The bytes [`note_refreshed`] counted for `copy` since the last report.
+#[cfg(test)]
+pub(crate) fn refreshed_bytes(copy: &Arc<Shadow>) -> u64 {
+    REFRESHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&(Arc::as_ptr(copy) as usize)))
+        .map_or(0, |e| e.3)
+}
+
+/// The frame report's line: how many copies were refreshed, the bytes of
+/// tracked and untracked ones, and the five that took most, per frame.
+pub(crate) fn log_refreshed(frames: f64) {
+    let Some(map) = REFRESHED.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mb = |b: u64| b as f64 / 1e6 / frames;
+    let (mut tracked, mut whole) = (0, 0);
+    for e in map.values() {
+        if e.2 { tracked += e.3 } else { whole += e.3 }
+    }
+    let mut top: Vec<_> = map.values().copied().collect();
+    top.sort_unstable_by_key(|e| std::cmp::Reverse(e.3));
+    let top: Vec<String> = top
+        .iter()
+        .take(5)
+        .map(|&(start, len, t, bytes, us)| {
+            format!(
+                "{start:#x}+{:.1} MB{} {:.1} MB {:.1} ms",
+                len as f64 / 1e6,
+                if t { "" } else { " (untracked)" },
+                mb(bytes),
+                us as f64 / 1e3 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "host copies refreshed per frame: {:.0} copies, tracked {:.1} MB, untracked (whole) {:.1} MB; most: {}",
+        map.len() as f64 / frames,
+        mb(tracked),
+        mb(whole),
+        top.join(", ")
+    );
+}
+
 /// Every host copy holding any of title memory `[from, to)`: buffers, loose
 /// windows and exact copies (`crate::host::same_copy`).
 pub(crate) fn over(from: usize, to: usize) -> Vec<Arc<Shadow>> {
@@ -3054,6 +3120,8 @@ pub(crate) fn near(va: u64) -> String {
 mod parallel_copy_tests;
 #[cfg(test)]
 mod snapshot_bench;
+#[cfg(test)]
+mod refresh_bench;
 #[cfg(test)]
 mod widened_bench;
 

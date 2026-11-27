@@ -224,6 +224,57 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Where [`sync_heaps`] spends its time, since the last frame report:
+/// [`SyncStat`]'s slots. Always counted (a few clock reads a page): the
+/// frame report's "heap views synced" phase is the largest of preparing.
+pub(crate) static SYNC_STATS: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// [`SYNC_STATS`]'s slots.
+#[derive(Clone, Copy)]
+pub(crate) enum SyncStat {
+    /// Calls (one a submission).
+    Syncs,
+    /// Microseconds taking the heaps' written ranges (their pages guarded again).
+    TakeUs,
+    /// 64 KiB pages (or parts) read.
+    Pages,
+    /// Microseconds reading them through the kernel.
+    ReadUs,
+    /// Microseconds checking their slots, making them included.
+    CheckUs,
+    /// Slots checked.
+    Slots,
+    /// Microseconds making slots again (`HostHeap::mirror_synced_batch`).
+    MakeUs,
+    /// Slots made again.
+    Made,
+}
+
+/// Adds `n` to `stat`.
+pub(crate) fn sync_stat(stat: SyncStat, n: u64) {
+    SYNC_STATS[stat as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The frame report's line for [`sync_heaps`], per frame over `frames`.
+pub(crate) fn log_sync(frames: f64) {
+    let s = SYNC_STATS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
+    let per = |n: u64| n as f64 / frames;
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    tracing::info!(
+        "heap views synced per frame: {:.1} syncs, {:.0} pages, {:.0} slots checked, {:.0} made again; ms: taking \
+         written ranges {:.1}, reading pages {:.1}, checking slots {:.1} (of it making them {:.1})",
+        per(s[0]),
+        per(s[2]),
+        per(s[5]),
+        per(s[7]),
+        ms(s[1]),
+        ms(s[3]),
+        ms(s[4]),
+        ms(s[6]),
+    );
+}
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -236,6 +287,8 @@ pub(crate) fn sync_heaps() {
     /// A heap's start, its address, and the ranges written since the last sync.
     type Written = (u64, usize, Vec<(usize, usize)>);
     // The written ranges of every heap, taken in one short hold of the lock.
+    let taking = std::time::Instant::now();
+    sync_stat(SyncStat::Syncs, 1);
     let work: Vec<Written> = {
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
@@ -281,6 +334,8 @@ pub(crate) fn sync_heaps() {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::SyncSlots, last.saturating_sub(first));
+        sync_stat(SyncStat::Slots, last.saturating_sub(first));
+        let checking = std::time::Instant::now();
         host.sync_slots_bytes(
             first as u32,
             last as u32,
@@ -289,10 +344,12 @@ pub(crate) fn sync_heaps() {
             range_from as u64,
             bytes,
         );
+        sync_stat(SyncStat::CheckUs, checking.elapsed().as_micros() as u64);
     };
 
     const SUB_PAGE: usize = 4 << 10;
     let page_size = crate::watch::PAGE;
+    sync_stat(SyncStat::TakeUs, taking.elapsed().as_micros() as u64);
     let mut page_buf = SYNC_PAGE_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()));
     if page_buf.len() < page_size {
         page_buf.resize(page_size, 0);
@@ -320,10 +377,14 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let len = end - page;
+                sync_stat(SyncStat::Pages, 1);
                 // By page: read the whole mapped range once; if part of a 64 KiB
                 // page is unmapped, fall back to 4 KiB OS pages so mapped slots
                 // are never skipped.
-                if crate::host::read_into(page as *const u8, &mut page_buf[..len]) {
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(page as *const u8, &mut page_buf[..len]);
+                sync_stat(SyncStat::ReadUs, reading.elapsed().as_micros() as u64);
+                if read {
                     sync_range(host, heap.desc.count, start, step, page, end, &page_buf[..len]);
                 } else {
                     for sub in (page & !(SUB_PAGE - 1)..end).step_by(SUB_PAGE) {

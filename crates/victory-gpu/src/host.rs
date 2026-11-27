@@ -5248,7 +5248,13 @@ impl Batch {
             for ((shadow, _), done) in work.into_iter().zip(results) {
                 let key = std::sync::Arc::as_ptr(&shadow) as usize;
                 let (start, len) = shadow.range();
-                for (from, to, copied, us) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                let done = done.into_inner().unwrap_or_else(|e| e.into_inner());
+                crate::shadow::note_refreshed(
+                    &shadow,
+                    done.iter().map(|d| d.2).sum(),
+                    done.iter().map(|d| d.3).sum(),
+                );
+                for (from, to, copied, us) in done {
                     #[cfg(feature = "diagnostics")]
                     {
                         counted.range(from, to - from, us, 0);
@@ -5280,6 +5286,7 @@ impl Batch {
             let copied = shadow.update_ranges(collected);
             // As above: the batch is timed as one, on its first range.
             let us = started.elapsed().as_micros() as u64;
+            crate::shadow::note_refreshed(&shadow, copied.iter().sum(), us);
             for (n, (&(from, to), copied)) in collected.iter().zip(copied).enumerate() {
                 let us = if n == 0 { us } else { 0 };
                 #[cfg(feature = "diagnostics")]
@@ -6145,6 +6152,10 @@ impl Meter {
                 .map(|(name, us)| format!("{name} {:.1}", ms(us)))
                 .collect();
             tracing::info!("host preparing per frame by phase, ms: {}", phases.join(", "));
+            #[cfg(windows)]
+            crate::descriptor::log_sync(report_frames);
+            crate::shadow::log_refreshed(report_frames);
+            crate::alias::log_unaliased();
             {
                 let k = COPY_KINDS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
                 let per = |n: u64| n as f64 / report_frames;
@@ -7201,6 +7212,24 @@ mod batch {
         super::same_copy::TEST_MODE.with(|m| m.set(mode));
         list.run_deferred(batch);
         super::same_copy::TEST_MODE.with(|m| m.set(0));
+    }
+
+    /// The frame report's refreshed-copies line counts each copy's
+    /// refreshed bytes, once per range brought up.
+    #[test]
+    fn refreshes_are_counted_by_copy() {
+        let Some((p, a)) = plain(2) else {
+            return; // no host GPU here
+        };
+        fill(p, 2 * PAGE, 0x5a);
+        let before = crate::shadow::refreshed_bytes(&a);
+        let mut batch = Batch::default();
+        batch.add(&a, p, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        // Another test's frame report may take the counts meanwhile.
+        let after = crate::shadow::refreshed_bytes(&a);
+        assert!(after == before + PAGE as u64 || after == PAGE as u64, "{before} then {after}");
+        done(p, Some(a));
     }
 
     /// `VICTORY_SAME_COPIES=skip`: a title copy whose bytes the destination

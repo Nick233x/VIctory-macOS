@@ -177,16 +177,26 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    if !at.is_null()
-        && victory_gpu::alias_buffers()
-        && kind & MEM_COMMIT != 0
-        && kind & MEM_RESERVE_PLACEHOLDER == 0
-        && protect == PAGE_READWRITE
-        && (at as usize).is_multiple_of(PAGE)
-        && size >= PAGE
-        && size.is_multiple_of(PAGE)
-    {
-        victory_gpu::alias_region(at as usize, size, false);
+    // Committed title memory: aliased zero-copy where it can be, else
+    // counted by why not (the frame report: what host copies refresh).
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        use victory_gpu::Unaliased as U;
+        let why = if !victory_gpu::alias_buffers() {
+            Some(U::Off)
+        } else if kind & MEM_RESERVE_PLACEHOLDER != 0 {
+            Some(U::Placeholder)
+        } else if protect != PAGE_READWRITE {
+            Some(U::Protection)
+        } else if !(at as usize).is_multiple_of(PAGE) || size < PAGE || !size.is_multiple_of(PAGE) {
+            Some(U::Unaligned)
+        } else if !victory_gpu::alias_region(at as usize, size, false) {
+            Some(U::Failed)
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            victory_gpu::note_unaliased(size, why);
+        }
     }
     if base.is_null() {
         tracing::debug!(

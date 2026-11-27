@@ -117,7 +117,7 @@ mod inplace_probe;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
-pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
+pub use alias::{Unaliased, alias_region, enabled as alias_buffers, note_unaliased, unalias_region};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
