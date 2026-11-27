@@ -1502,6 +1502,8 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
+    /// A marker group for the bound pipeline is open ([`markers`]).
+    marked: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -1576,6 +1578,17 @@ fn timing() -> bool {
 fn split_uav_srv_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE"))
+}
+
+/// Whether host lists group each title pipeline's commands in a marker
+/// group named by its shaders (`VICTORY_GPU_MARKERS=1`), so that a GPU
+/// capture or trace of the host can tell them apart: D3D12 timestamps all
+/// read 0 under D3DMetal, so `VICTORY_GPU_TIMING` cannot time them on a
+/// Mac. Whether a tool shows the groups is up to the host's driver (on a
+/// Mac, D3DMetal's debug groups); off, nothing is recorded.
+pub(crate) fn markers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_MARKERS"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1658,6 +1671,10 @@ const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
 const ARGUMENT_CHUNK_FIRST: u64 = 64 << 10;
 const ARGUMENT_CHUNK_MAX: u64 = 4 << 20;
 const MAX_HAZARD_RANGES: usize = 256;
+/// Clamps a list started for a clamp must hoist before another is cut for
+/// ([`HostList::clamp_cut_pays`]): with one, the cut cost what clamping
+/// inline would have.
+const CUT_PAYS: usize = 2;
 
 struct ArgumentChunk {
     buffer: ID3D12Resource,
@@ -1670,6 +1687,19 @@ struct ArgumentChunk {
 /// their argument range nor their count word could have been written earlier
 /// in the same list, and preserves sequential budget order once any inline
 /// clamp has run.
+/// Why an indirect argument clamp cannot run in its list's prelude.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClampBlock {
+    /// An earlier command of the list may write any title buffer (heap
+    /// views, title memory).
+    Unknown,
+    /// An earlier command of the list writes the arguments or the count.
+    Overlap,
+    /// An earlier clamp of the list ran inline (the budget is charged in
+    /// recorded order).
+    AfterInline,
+}
+
 #[derive(Default)]
 pub(crate) struct WriteHazard {
     /// Sorted, disjoint, non-empty half-open title address ranges `[start, end)`.
@@ -1736,19 +1766,29 @@ impl WriteHazard {
         pos < self.ranges.len() && self.ranges[pos].0 < end
     }
 
+    #[cfg(test)]
     pub(crate) fn can_hoist(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
-        if self.inline_used || self.unknown {
-            return false;
+        self.blocker(arguments, len, count).is_none()
+    }
+
+    /// What keeps a clamp of `[arguments, arguments + len)` (and the
+    /// 4-byte `count`) out of the prelude, if anything.
+    pub(crate) fn blocker(
+        &self,
+        arguments: u64,
+        len: u64,
+        count: Option<u64>,
+    ) -> Option<ClampBlock> {
+        if self.inline_used {
+            return Some(ClampBlock::AfterInline);
         }
-        if self.overlaps(arguments, len) {
-            return false;
+        if self.unknown {
+            return Some(ClampBlock::Unknown);
         }
-        if let Some(at) = count
-            && self.overlaps(at, 4)
-        {
-            return false;
+        if self.overlaps(arguments, len) || count.is_some_and(|at| self.overlaps(at, 4)) {
+            return Some(ClampBlock::Overlap);
         }
-        true
+        None
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1768,6 +1808,9 @@ struct HoistedClamps {
     pending: Vec<crate::indirect::PendingClamp>,
     budget_gpu: u64,
     hazard: WriteHazard,
+    /// The list was started for a clamp that could not run in the prelude
+    /// of the one before it (`crate::list::cut_for_clamp`).
+    cut: bool,
 }
 
 impl HoistedClamps {
@@ -2032,6 +2075,7 @@ impl HostGpu for Host {
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
                 clamps: Mutex::default(),
+                marked: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -3219,6 +3263,7 @@ impl HostList {
         self.textures_back();
         self.widen_close();
         self.hoisted_clamps_close();
+        self.end_marker();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -3251,6 +3296,7 @@ impl HostList {
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trim_scratch();
         self.reset_hoisted_clamps();
+        self.marked.store(false, Ordering::Relaxed);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -3827,6 +3873,31 @@ impl HostList {
 
     /// Keeps `pso` and `root` alive until the list is reset and records `name`,
     /// deduplicated per pipeline pointer until reset.
+    /// With [`markers`] on: the commands from here to the next pipeline
+    /// bound (or the end of the list) in a marker group named `name`, the
+    /// title pipeline's shaders.
+    pub(crate) fn mark_pipeline(&self, name: &str) {
+        if !markers() {
+            return;
+        }
+        self.end_marker();
+        let text: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        const UNICODE: u32 = 0;
+        // SAFETY: an open list; the text is copied when recorded.
+        unsafe {
+            self.list
+                .BeginEvent(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+        };
+        self.marked.store(true, Ordering::Relaxed);
+    }
+
+    fn end_marker(&self) {
+        if self.marked.swap(false, Ordering::Relaxed) {
+            // SAFETY: an open list with the group `mark_pipeline` began.
+            unsafe { self.list.EndEvent() };
+        }
+    }
+
     pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
         {
             let mut deferred = self.deferred();
@@ -3962,12 +4033,43 @@ impl HostList {
     /// Whether an indirect execution reading `[arguments, arguments + len)`
     /// (and optional 4-byte `count`) has no earlier conflicting GPU write or
     /// inline clamp in this list and may be clamped in `prelude`.
+    #[cfg(test)]
     pub(crate) fn can_hoist_clamp(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
+        self.clamp_blocker(arguments, len, count).is_none()
+    }
+
+    /// What keeps the clamp of an indirect execution reading
+    /// `[arguments, arguments + len)` (and the 4-byte `count`) out of
+    /// `prelude`: `None` if it may be hoisted there.
+    pub(crate) fn clamp_blocker(
+        &self,
+        arguments: u64,
+        len: u64,
+        count: Option<u64>,
+    ) -> Option<ClampBlock> {
         self.clamps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .hazard
-            .can_hoist(arguments, len, count)
+            .blocker(arguments, len, count)
+    }
+
+    /// The list was started for a clamp the list before it could not
+    /// hoist (`crate::list::cut_for_clamp`).
+    pub(crate) fn mark_clamp_cut(&self) {
+        self.clamps.lock().unwrap_or_else(|e| e.into_inner()).cut = true;
+    }
+
+    /// Whether a clamp this list cannot hoist is worth a new list of its
+    /// own: always, unless this list was itself started for a clamp and
+    /// took fewer than [`CUT_PAYS`] into its prelude before the next write
+    /// blocked one. Such a cut bought nothing over clamping inline (one
+    /// compute pass and one restarted render pass either way), and a title
+    /// that writes before every execution would cut before every one, so
+    /// the rest of the list clamps inline as before.
+    pub(crate) fn clamp_cut_pays(&self) -> bool {
+        let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        !clamps.cut || clamps.pending.len() >= CUT_PAYS
     }
 
     /// Allocates a 16-byte-aligned slice of `bytes` in this list's hoisted
@@ -4063,6 +4165,7 @@ impl HostList {
             clamps.pending.clear();
             clamps.budget_gpu = 0;
             clamps.hazard.clear();
+            clamps.cut = false;
             let kept = (clamps.touched + 1).min(clamps.chunks.len());
             let spent_chunks = clamps.chunks.split_off(kept);
             let spent_oversized = std::mem::take(&mut clamps.oversized);
@@ -5606,6 +5709,9 @@ impl Meter {
                 crate::indirect::take_records().map(|n| n as f64 / report_frames);
             let [hoisted, inline] =
                 crate::indirect::take_clamps().map(|n| n as f64 / report_frames);
+            let [anywhere, theirs, after_inline, unbatched] =
+                crate::indirect::take_inline_why().map(|n| n as f64 / report_frames);
+            let clamp_cuts = crate::indirect::take_cuts() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -5613,7 +5719,10 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count; clamps \
-                 {hoisted:.0} hoisted, {inline:.0} inline)",
+                 {hoisted:.0} hoisted, {inline:.0} inline: {anywhere:.0} after a write \
+                 anywhere, {theirs:.0} after a write of theirs, {after_inline:.0} after an \
+                 inline one, {unbatched:.0} unbatched; {clamp_cuts:.1} host lists started \
+                 for clamps)",
                 making = crate::pipeline::making()
             );
             crate::ray_skip::log(report_frames);
