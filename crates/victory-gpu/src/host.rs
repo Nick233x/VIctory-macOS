@@ -3466,15 +3466,22 @@ impl HostList {
         side: u8,
         writes: bool,
         whole: bool,
+        stores: bool,
     ) -> Option<bool> {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(crate::twin::Use::new(depth, side, writes, whole));
+                let u = v.insert(crate::twin::Use::new(depth, side, writes, whole));
+                if stores {
+                    u.store();
+                }
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let copy = o.get_mut().again(side, writes, whole);
+                if stores {
+                    o.get_mut().store();
+                }
                 if copy.is_some() || writes {
                     self.changed_something();
                 }

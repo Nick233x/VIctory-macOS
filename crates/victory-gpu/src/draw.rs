@@ -3010,7 +3010,13 @@ fn readable_entry(list: &HostList, u: &UsedResource, view: &View, marked: bool, 
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, *resource as This);
             list.texture_written(*resource as This);
-            crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            if writes {
+                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            } else {
+                // No shader stores through it (`crate::twin`: a depth
+                // texture's twin stays as current as it was).
+                crate::twin::reading(|| crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS));
+            }
         }
         _ => {}
     }
