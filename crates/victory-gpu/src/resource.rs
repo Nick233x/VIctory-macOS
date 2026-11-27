@@ -1812,9 +1812,10 @@ fn made(r: &Resource) -> Option<std::sync::Arc<HostTexture>> {
     r.host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
 }
 
-/// Milliseconds since the first call: host textures' use stamps.
+/// Milliseconds since the first call: host textures' and host copies' use
+/// stamps.
 #[cfg(windows)]
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
@@ -1897,6 +1898,8 @@ pub(crate) fn evict_heap_uav() -> bool {
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
 /// the card's budget the least recently used ones until [`BUDGET_LOW`].
+/// Host copies of title memory nothing asked for in as long go too
+/// ([`crate::shadow::release_stale`]).
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1917,6 +1920,7 @@ pub(crate) fn evict_unused() {
     // Host copies of title memory take the same memory and textures give
     // back only part of it: the idle ones go too.
     crate::shadow::release_idle(frame, ram);
+    crate::shadow::release_stale(frame);
 }
 
 /// Where the card's memory is the computer's own (unified: Apple silicon
