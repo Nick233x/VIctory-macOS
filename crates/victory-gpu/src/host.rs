@@ -4488,6 +4488,40 @@ impl HostList {
         bits
     }
 
+    /// Adds what the list's landing writes to `w`
+    /// (`VICTORY_PREP_AHEAD=ranges`); `false` if that is not known before it
+    /// runs: work after it, read-backs, table textures, or a bottom-of-pipe
+    /// write into a host copy (shaders after it would read the copy's older
+    /// bytes until a refresh).
+    pub(crate) fn ahead_writes(&self, w: &mut flight::Writes) -> bool {
+        use flight::NotQuiet as N;
+        let known = (1 << N::Declared as u8) | (1 << N::Marks as u8) | (1 << N::BottomOfPipe as u8);
+        if self.not_quiet_reasons() & !known != 0 {
+            return false;
+        }
+        if self.marks_writes() {
+            w.marks();
+        }
+        let d = self.deferred();
+        for &(at, _, bytes) in &d.writes {
+            if crate::shadow::find(at as u64, bytes as u64).is_some() {
+                return false;
+            }
+            w.span(at, at.saturating_add(bytes));
+        }
+        for step in &d.copies {
+            if let Step::GpuWrite(shadow, address, len, marked, _) = step {
+                let (copy, (start, size)) = (std::sync::Arc::as_ptr(shadow) as usize, shadow.range());
+                if *marked {
+                    w.whole(copy, start as usize, (start + size) as usize);
+                } else {
+                    w.declared(copy, *address, address.saturating_add(*len));
+                }
+            }
+        }
+        true
+    }
+
     pub(crate) fn marks_writes(&self) -> bool {
         let unknown = self.clamps.lock().unwrap_or_else(|e| e.into_inner()).hazard.unknown;
         let d = self.deferred();
@@ -4802,6 +4836,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    flight::before_cpu_read(Some((src, len)));
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -4819,6 +4854,7 @@ impl HostList {
                     continue;
                 }
                 Step::Host(work) => {
+                    flight::before_cpu_read(None);
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -4830,6 +4866,11 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len, marked, _) => {
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
+                    flight::before_gpu_write(
+                        std::sync::Arc::as_ptr(shadow) as usize,
+                        *address,
+                        *len,
+                    );
                     if !marked {
                         batch.flush();
                     }
@@ -5022,6 +5063,7 @@ impl Batch {
         }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         flight::probe_refresh(key, address, len);
+        flight::before_refresh(key, address, len);
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.
         let empty = crate::ranges::Ranges::default();

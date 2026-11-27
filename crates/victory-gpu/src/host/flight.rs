@@ -104,6 +104,15 @@ impl ModeGuard {
     }
 
     pub(crate) fn with_prep_ahead(flight1: bool, async_submit: bool, ahead: bool) -> Self {
+        Self::with_mode(flight1, async_submit, if ahead { 2 } else { 1 })
+    }
+
+    /// Flight-1 with `VICTORY_PREP_AHEAD=ranges`.
+    pub(crate) fn with_prep_ranges() -> Self {
+        Self::with_mode(true, false, 3)
+    }
+
+    fn with_mode(flight1: bool, async_submit: bool, ahead: u8) -> Self {
         let lock = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::queue::drain_submit(crate::queue::Why::Present);
         if let Some(h) = super::host() {
@@ -111,7 +120,7 @@ impl ModeGuard {
         }
         let prev_flight1 = TEST_FLIGHT1.swap(if flight1 { 2 } else { 1 }, Ordering::AcqRel);
         let prev_async = TEST_ASYNC_SUBMIT.swap(if async_submit { 2 } else { 1 }, Ordering::AcqRel);
-        let prev_ahead = TEST_PREP_AHEAD.swap(if ahead { 2 } else { 1 }, Ordering::AcqRel);
+        let prev_ahead = TEST_PREP_AHEAD.swap(ahead, Ordering::AcqRel);
         Self {
             _lock: lock,
             prev_flight1,
@@ -238,11 +247,22 @@ pub(crate) enum Early {
     Marks,
     /// No second mark could be made.
     NoMark,
+    /// `VICTORY_PREP_AHEAD=ranges`: the new flight refreshes or writes host
+    /// copy bytes the one in the air writes (or any of a copy its shaders
+    /// may mark).
+    Overlap,
+    /// `VICTORY_PREP_AHEAD=ranges`: the new flight reads title memory on
+    /// the CPU (a fill from what the one in the air writes, or host work).
+    CpuRead,
 }
 
 /// [`AHEAD`]'s slots: flights prepared while one was in the air, of them
 /// launched while it still was, then one per [`Early`].
-const AHEAD_SLOTS: usize = 2 + Early::NoMark as usize + 1;
+const AHEAD_SLOTS: usize = 2 + Early::CpuRead as usize + 1;
+
+/// Preparations behind a flight that was not quiet but whose writes were
+/// known (`VICTORY_PREP_AHEAD=ranges`), since the last frame report.
+static BEHIND_BY_RANGES: AtomicU64 = AtomicU64::new(0);
 
 /// Counts since the last frame report ([`AHEAD_SLOTS`]).
 static AHEAD: [AtomicU64; AHEAD_SLOTS] = [const { AtomicU64::new(0) }; AHEAD_SLOTS];
@@ -253,6 +273,132 @@ thread_local! {
     /// thread holds), for [`land_ahead`].
     static PREPARING_AHEAD: std::cell::Cell<Option<(*const Host, *mut u64)>> =
         const { std::cell::Cell::new(None) };
+    /// While this thread prepares a flight behind one that is not quiet
+    /// (`VICTORY_PREP_AHEAD=ranges`): what that one writes, which the
+    /// preparation must not read or rewrite before it lands.
+    static AHEAD_OF: std::cell::RefCell<Option<Writes>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What a flight writes that a preparation behind it must not read early
+/// (`VICTORY_PREP_AHEAD=ranges`): known before it runs, unlike the pages
+/// its shaders mark, which only their bound (the copies owning mark bits)
+/// is.
+#[derive(Clone, Default)]
+pub(crate) struct Writes {
+    /// Title memory, as sorted, merged `[from, to)`: the ranges its shaders
+    /// declared (whole 64 KiB pages: the trackers take pages), its
+    /// bottom-of-pipe writes, and every copy its shaders may mark.
+    spans: Vec<(usize, usize)>,
+    /// Host copies (by address) none of whose bytes a preparation may
+    /// refresh: those its shaders may mark.
+    whole: std::collections::HashSet<usize>,
+    /// Host copies its shaders write in declared ranges: a preparation may
+    /// refresh other ranges of them, but not declare writes of its own
+    /// there (one snapshot, one pending set a copy).
+    written: std::collections::HashSet<usize>,
+    /// Whether its shaders mark what they write.
+    marks: bool,
+}
+
+impl Writes {
+    /// Adds title range `[from, to)` (unsorted until [`Self::seal`]).
+    pub(crate) fn span(&mut self, from: usize, to: usize) {
+        if from < to {
+            self.spans.push((from, to));
+        }
+    }
+
+    /// Adds a declared write of copy `copy` at `[from, to)`.
+    pub(crate) fn declared(&mut self, copy: usize, from: usize, to: usize) {
+        let page = crate::watch::PAGE;
+        self.written.insert(copy);
+        self.span(from / page * page, to.div_ceil(page).saturating_mul(page));
+    }
+
+    /// Adds every byte of copy `copy` at `[from, to)`.
+    pub(crate) fn whole(&mut self, copy: usize, from: usize, to: usize) {
+        self.whole.insert(copy);
+        self.span(from, to);
+    }
+
+    /// The flight's shaders mark what they write.
+    pub(crate) fn marks(&mut self) {
+        self.marks = true;
+    }
+
+    /// Sorts and merges the spans.
+    fn seal(&mut self) {
+        self.spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.spans.len());
+        for &(from, to) in &self.spans {
+            match merged.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        self.spans = merged;
+    }
+
+    /// Whether `[from, to)` shares a byte with the spans (sealed).
+    fn overlaps(&self, from: usize, to: usize) -> bool {
+        let i = self.spans.partition_point(|&(_, end)| end <= from);
+        self.spans.get(i).is_some_and(|&(start, _)| start < to && from < to)
+    }
+
+    /// For the preparation behind the flight: sealed, with every copy its
+    /// shaders may mark (as of now: a copy made later has no bits the
+    /// flight's shaders could mark).
+    fn behind(&self) -> Self {
+        let mut w = self.clone();
+        if w.marks {
+            for (copy, from, len) in crate::shadow::mark_owner_extents() {
+                w.whole(copy, from, from + len);
+            }
+        }
+        w.seal();
+        w
+    }
+}
+
+/// Before a preparation refreshes `[address, address + len)` of copy
+/// `copy`: lands the flight in the air first if it writes there.
+pub(crate) fn before_refresh(copy: usize, address: usize, len: usize) {
+    let hit = AHEAD_OF.with(|w| {
+        w.borrow().as_ref().is_some_and(|w| {
+            w.whole.contains(&copy) || w.overlaps(address, address.saturating_add(len))
+        })
+    });
+    if hit {
+        land_ahead(Early::Overlap);
+    }
+}
+
+/// Before a preparation declares that its shaders write
+/// `[address, address + len)` of copy `copy` (`Shadow::writing`).
+pub(crate) fn before_gpu_write(copy: usize, address: usize, len: usize) {
+    let hit = AHEAD_OF.with(|w| {
+        w.borrow().as_ref().is_some_and(|w| {
+            w.whole.contains(&copy)
+                || w.written.contains(&copy)
+                || w.overlaps(address, address.saturating_add(len))
+        })
+    });
+    if hit {
+        land_ahead(Early::Overlap);
+    }
+}
+
+/// Before a preparation reads title memory on the CPU: `[address, address
+/// + len)`, or anything (`None`, host work).
+pub(crate) fn before_cpu_read(range: Option<(usize, usize)>) {
+    let hit = AHEAD_OF.with(|w| {
+        w.borrow().as_ref().is_some_and(|w| {
+            range.is_none_or(|(address, len)| w.overlaps(address, address.saturating_add(len)))
+        })
+    });
+    if hit {
+        land_ahead(Early::CpuRead);
+    }
 }
 
 /// Lands the flights in the air first if this thread prepares one behind
@@ -268,6 +414,7 @@ pub(crate) fn land_ahead(why: Early) {
     if host.has_in_flight() {
         AHEAD[2 + why as usize].fetch_add(1, Ordering::Relaxed);
         PREPARING_AHEAD.with(|c| c.set(None));
+        AHEAD_OF.with(|w| w.borrow_mut().take());
         host.finish_flight_locked(submitted, None, None);
     }
 }
@@ -290,18 +437,51 @@ pub(crate) fn prep_ahead_enabled() -> bool {
     #[cfg(test)]
     match TEST_PREP_AHEAD.load(Ordering::Acquire) {
         1 => return false,
-        2 => return flight1_enabled(),
+        2 | 3 => return flight1_enabled(),
         _ => {}
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = flight1_enabled() && std::env::var_os("VICTORY_PREP_AHEAD").is_some_and(|v| v == "1");
+        let on = flight1_enabled()
+            && std::env::var_os("VICTORY_PREP_AHEAD").is_some_and(|v| v == "1" || v == "ranges");
         if on {
             tracing::info!(
-                "host submissions prepared while the one before is in flight (VICTORY_PREP_AHEAD=1)"
+                ranges = prep_ranges_enabled(),
+                "host submissions prepared while the one before is in flight (VICTORY_PREP_AHEAD)"
             );
         }
         on
+    })
+}
+
+/// `VICTORY_PREP_AHEAD=ranges` (off by default): a submission is also
+/// prepared behind a flight that is not quiet at landing, when what makes
+/// it so is known before it runs ([`HostList::ahead_writes`]): ranges its
+/// shaders declare, write marks (bound by the copies owning mark bits) and
+/// bottom-of-pipe writes outside host copies. The preparation then lands
+/// it first only where it would read or rewrite those ([`Writes`],
+/// [`Early::Overlap`], [`Early::CpuRead`]).
+///
+/// Its landing writes title memory the preparation did not read, and puts
+/// nothing into host copies: what its shaders wrote is in them already,
+/// and a refresh of other bytes of a copy touches neither its snapshot nor
+/// its pending ranges (`Shadow::update_ranges` syncs only bytes in pending
+/// ranges into the snapshot).
+///
+/// shortcut: a texture over memory the flight's shaders write is brought up
+/// from title memory, which its landing writes: a texture the preparation
+/// brings up there is the bytes from before the flight, one submission late,
+/// as one written in the same submission already is (`bindless::uploads`).
+pub(crate) fn prep_ranges_enabled() -> bool {
+    #[cfg(test)]
+    match TEST_PREP_AHEAD.load(Ordering::Acquire) {
+        3 => return flight1_enabled(),
+        1 | 2 => return false,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        flight1_enabled() && std::env::var_os("VICTORY_PREP_AHEAD").is_some_and(|v| v == "ranges")
     })
 }
 
@@ -347,7 +527,8 @@ pub(crate) fn log_frame(frames: f64) {
             "host submissions prepared while the last was in flight per frame: {:.1}, launched while it still \
              was {:.1}; landed it first for: not quiet at landing {:.1}, eviction {:.1}, view remake {:.1}, \
              barrier lists {:.1}, heap fill {:.1}, title copies {:.1}, marks of the new one {:.1}, no second \
-             mark {:.1}",
+             mark {:.1}; behind one not quiet by ranges {:.1} (VICTORY_PREP_AHEAD=ranges), landed it first for \
+             what it writes {:.1}, CPU reads {:.1}",
             per(ahead[0]),
             per(ahead[1]),
             per(ahead[2]),
@@ -358,6 +539,9 @@ pub(crate) fn log_frame(frames: f64) {
             per(ahead[7]),
             per(ahead[8]),
             per(ahead[9]),
+            per(BEHIND_BY_RANGES.swap(0, Ordering::Relaxed)),
+            per(ahead[10]),
+            per(ahead[11]),
         );
     }
 }
@@ -538,6 +722,9 @@ struct InFlight {
     quiet: bool,
     /// Title fences attached behind it.
     signals: Vec<(usize, u64)>,
+    /// Not quiet, but what its landing writes is known
+    /// (`VICTORY_PREP_AHEAD=ranges`).
+    writes: Option<Writes>,
 }
 
 // SAFETY: Every field is `Send` (D3D12 objects are free-threaded; `HostList`
@@ -580,9 +767,20 @@ impl Host {
                 self.finish_flight_locked(&mut submitted, Some(v), None);
             }
         }
-        let behind = ahead && {
+        // Behind one quiet at landing, or (`VICTORY_PREP_AHEAD=ranges`) one
+        // whose writes are known: what the preparation must keep off.
+        let (behind, ahead_of) = if ahead {
             let state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
-            state.flights.len() == 1 && state.flights[0].quiet
+            match state.flights.front() {
+                Some(f) if state.flights.len() == 1 && f.quiet => (true, None),
+                Some(f) if state.flights.len() == 1 => match &f.writes {
+                    Some(w) => (true, Some(w.behind())),
+                    None => (false, None),
+                },
+                _ => (false, None),
+            }
+        } else {
+            (false, None)
         };
         if !behind {
             if ahead && self.has_in_flight() {
@@ -600,6 +798,10 @@ impl Host {
             AHEAD[0].fetch_add(1, Ordering::Relaxed);
             let counter: *mut u64 = &mut *submitted;
             PREPARING_AHEAD.with(|c| c.set(Some((self as *const Host, counter))));
+            if ahead_of.is_some() {
+                BEHIND_BY_RANGES.fetch_add(1, Ordering::Relaxed);
+            }
+            AHEAD_OF.with(|w| *w.borrow_mut() = ahead_of);
         }
         let probing = ahead && !behind;
         if probing {
@@ -627,6 +829,7 @@ impl Host {
             land_ahead(Early::NoMark);
         }
         PREPARING_AHEAD.with(|c| c.set(None));
+        AHEAD_OF.with(|w| w.borrow_mut().take());
         let still_behind = behind && self.has_in_flight();
         if still_behind {
             AHEAD[1].fetch_add(1, Ordering::Relaxed);
@@ -710,6 +913,12 @@ impl Host {
         FLIGHTS.fetch_add(1, Ordering::Relaxed);
 
         let quiet = prep.uploads.is_none() && segments.iter().all(|s| s.quiet_at_landing());
+        let writes = (!quiet && prep.uploads.is_none() && prep_ranges_enabled())
+            .then(|| {
+                let mut w = Writes::default();
+                segments.iter().all(|s| s.ahead_writes(&mut w)).then_some(w)
+            })
+            .flatten();
         let split_count = native_boundaries.len();
         let flight = InFlight {
             fence_value,
@@ -724,6 +933,7 @@ impl Host {
             waited,
             quiet,
             signals: Vec::new(),
+            writes,
         };
         {
             let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
@@ -1738,6 +1948,159 @@ void main(uint3 id : SV_DispatchThreadID) {
         // copy (still registered, as the title never released it) would be
         // found again at the same address with this attempt's bytes.
         let _ = layout;
+        taken
+    }
+
+    #[test]
+    fn writes_keep_declared_pages_bottom_of_pipe_bytes_and_whole_copies() {
+        let page = crate::watch::PAGE;
+        let mut w = Writes::default();
+        w.declared(1, page + 8, page + 12);
+        w.span(10 * page + 3, 10 * page + 5);
+        w.whole(2, 20 * page, 21 * page);
+        w.declared(1, 2 * page, 2 * page + 1);
+        let w = w.behind();
+        // Declared bytes count as their whole pages, joined where they meet.
+        assert_eq!(w.spans[0], (page, 3 * page));
+        assert!(w.overlaps(page, page + 1) && w.overlaps(3 * page - 1, 3 * page));
+        assert!(!w.overlaps(0, page) && !w.overlaps(3 * page, 4 * page));
+        // Bottom-of-pipe writes are their bytes only.
+        assert!(w.overlaps(10 * page + 4, 10 * page + 100));
+        assert!(!w.overlaps(10 * page, 10 * page + 3) && !w.overlaps(10 * page + 5, 11 * page));
+        assert!(w.overlaps(20 * page + 77, 20 * page + 78));
+        assert!(!w.overlaps(5, 5), "an empty range overlaps nothing");
+        assert!(w.whole.contains(&2) && w.written.contains(&1) && !w.whole.contains(&1));
+    }
+
+    /// 64 KiB of zeroed title memory on its own pages (never freed: see
+    /// [`launches_behind_once`]), and its host copy.
+    fn title_page() -> (*mut u8, u64, Arc<crate::shadow::Shadow>) {
+        let page = crate::watch::PAGE;
+        let layout = std::alloc::Layout::from_size_align(page, page).unwrap();
+        // SAFETY: valid layout.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let shadow = crate::shadow::find(ptr as u64, page as u64).expect("shadow");
+        (ptr, ptr as u64, shadow)
+    }
+
+    /// A list whose shader-like copy writes `value` into the first word of
+    /// `shadow`'s copy of `at`, declared as a GPU write (it goes back).
+    fn writes_back(host: &Host, shadow: &Arc<crate::shadow::Shadow>, at: u64, value: u32) -> Arc<HostList> {
+        let (src, src_ptr) = host.upload_buffer(64).expect("upload buffer");
+        // SAFETY: mapped 64-byte upload buffer.
+        unsafe { src_ptr.cast::<u32>().write_volatile(value) };
+        let seg = Arc::new(host.new_list().expect("host list"));
+        // SAFETY: open host list, valid D3D12 buffers.
+        unsafe { seg.list.CopyBufferRegion(&shadow.buffer, shadow.offset(at), &src, 0, 4) };
+        seg.keep(&src);
+        shadow.gpu_writes(&seg, at, 4, false);
+        seg.close();
+        seg
+    }
+
+    /// A list refreshing the first 64 bytes of `shadow`'s copy of `at` and
+    /// copying its first word into `out`.
+    fn reads(
+        host: &Host,
+        shadow: &Arc<crate::shadow::Shadow>,
+        at: u64,
+        out: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    ) -> Arc<HostList> {
+        let seg = Arc::new(host.new_list().expect("host list"));
+        shadow.refresh(&seg, at, 64);
+        // SAFETY: open list, valid buffers.
+        unsafe { seg.list.CopyBufferRegion(out, 0, &shadow.buffer, shadow.offset(at), 4) };
+        seg.keep(out);
+        seg.close();
+        seg
+    }
+
+    /// With `VICTORY_PREP_AHEAD=ranges`, a submission behind a flight whose
+    /// shaders write other memory (which goes back when it lands) is
+    /// prepared and launched while that one is in the air: two in flight.
+    /// Its refresh reads what the title wrote, and the first one's write
+    /// goes back.
+    #[test]
+    fn prep_ranges_launches_behind_a_flight_writing_other_memory() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::with_prep_ranges();
+        until_taken(|| ranges_behind_once(host));
+    }
+
+    fn ranges_behind_once(host: &Host) -> bool {
+        crate::resource::evict_unused();
+        let (a_ptr, a, a_copy) = title_page();
+        let (b_ptr, b, b_copy) = title_page();
+        let (out, out_ptr) = host.mapped_buffer(64, true).expect("out");
+        let before = ahead_counts();
+        let by_ranges = BEHIND_BY_RANGES.load(Ordering::Relaxed);
+
+        TEST_PAUSE_LANDING.store(true, Ordering::Release);
+        let seg1 = writes_back(host, &a_copy, a, 0xCAFE_BABE);
+        assert!(!seg1.quiet_at_landing());
+        host.execute_flight1(vec![seg1], vec![]);
+        // The title writes the other memory while the flight is in the air.
+        // SAFETY: valid title memory.
+        unsafe { b_ptr.cast::<u32>().write_volatile(0x2222_0002) };
+        host.execute_flight1(vec![reads(host, &b_copy, b, &out)], vec![]);
+        let after = ahead_counts();
+        let taken = after[0] - before[0] == 1
+            && after[1] - before[1] == 1
+            && BEHIND_BY_RANGES.load(Ordering::Relaxed) > by_ranges
+            && flights_in_air(host) == 2;
+
+        TEST_PAUSE_LANDING.store(false, Ordering::Release);
+        host.finish_flight_now();
+        // SAFETY: both flights have landed.
+        unsafe {
+            assert_eq!(a_ptr.cast::<u32>().read_volatile(), 0xCAFE_BABE, "the GPU's write went back");
+            assert_eq!(out_ptr.cast::<u32>().read_volatile(), 0x2222_0002, "the refresh read the title's write");
+        }
+        taken
+    }
+
+    /// The hazard the range rule must not cross: a submission refreshing
+    /// bytes the flight in the air writes. That flight lands first (in the
+    /// middle of the preparation), so the refresh does not put the title's
+    /// older bytes over the GPU's write: both the title and the newer
+    /// flight see it.
+    #[test]
+    fn prep_ranges_lands_before_refreshing_what_the_flight_writes() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::with_prep_ranges();
+        until_taken(|| ranges_overlap_once(host));
+    }
+
+    fn ranges_overlap_once(host: &Host) -> bool {
+        crate::resource::evict_unused();
+        let (a_ptr, a, a_copy) = title_page();
+        let (out, out_ptr) = host.mapped_buffer(64, true).expect("out");
+        let before = ahead_counts();
+        let overlap = 2 + Early::Overlap as usize;
+
+        TEST_PAUSE_LANDING.store(true, Ordering::Release);
+        host.execute_flight1(vec![writes_back(host, &a_copy, a, 0xCAFE_BABE)], vec![]);
+        // The title writes beside what the GPU writes: the copy needs a
+        // refresh, which covers the GPU's word too.
+        // SAFETY: valid title memory.
+        unsafe { a_ptr.add(32).cast::<u32>().write_volatile(0x3333_0003) };
+        host.execute_flight1(vec![reads(host, &a_copy, a, &out)], vec![]);
+        let after = ahead_counts();
+        let taken = after[0] - before[0] == 1 && after[overlap] - before[overlap] == 1;
+        assert_eq!(after[1], before[1], "launched behind a flight writing what it refreshed");
+
+        TEST_PAUSE_LANDING.store(false, Ordering::Release);
+        host.finish_flight_now();
+        // SAFETY: both flights have landed.
+        unsafe {
+            assert_eq!(a_ptr.cast::<u32>().read_volatile(), 0xCAFE_BABE, "the GPU's write went back");
+            assert_eq!(out_ptr.cast::<u32>().read_volatile(), 0xCAFE_BABE, "the refresh overwrote it");
+            assert_eq!(a_ptr.add(32).cast::<u32>().read_volatile(), 0x3333_0003);
+        }
         taken
     }
 

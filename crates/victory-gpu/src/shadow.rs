@@ -1527,6 +1527,20 @@ pub(crate) fn mark_owners() -> std::collections::HashSet<usize> {
         .collect()
 }
 
+/// [`mark_owners`], each with its memory (start, bytes):
+/// `VICTORY_PREP_AHEAD=ranges` keeps a preparation off all of it while a
+/// flight marking its writes is in the air.
+pub(crate) fn mark_owner_extents() -> Vec<(usize, usize, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    marks()
+        .owners
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+        .map(|s| (Arc::as_ptr(&s) as usize, s.start as usize, s.len as usize))
+        .collect()
+}
+
 fn marks() -> std::sync::MutexGuard<'static, Marks> {
     MARKS.lock().unwrap_or_else(|e| e.into_inner())
 }
