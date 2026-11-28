@@ -2317,6 +2317,10 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
     gone
 }
 
+/// Times eviction gave host textures up ([`give_up`]).
+#[cfg(windows)]
+pub(crate) static GIVE_UPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Gives up host textures `gone` at `frame`: first every heap slot viewing
 /// one gets a null view (made again when a draw or a shader reads it), then
 /// the title textures let go of it. Lists recorded before hold it until
@@ -2325,10 +2329,6 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
 /// shortcut: a use racing this (a title thread recording) may view the
 /// texture made again in a list that moved the one given up; the pass
 /// gives up only textures unused for a while, or the least recently used.
-/// Times eviction gave host textures up ([`give_up`]).
-#[cfg(windows)]
-pub(crate) static GIVE_UPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 #[cfg(windows)]
 fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2348,10 +2348,13 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
     // Before any of them can go: what the heaps' cached walk keeps of them
     // (their trackers' bits, which a tracker made later may take) is looked
-    // at again (`crate::bindless`).
+    // at again (`crate::bindless`). Marked given up first: a walk that sees
+    // the count move sees them given up, and forgets what it kept of them.
+    for (t, _) in gone {
+        t.given_up.store(true, std::sync::atomic::Ordering::Release);
+    }
     GIVE_UPS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     for (t, owners) in gone {
-        t.given_up.store(true, std::sync::atomic::Ordering::Release);
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
