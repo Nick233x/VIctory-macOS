@@ -166,6 +166,7 @@ A diagnostics build also logs one bounded line per submission that refreshes tit
 | --- | --- |
 | `VICTORY_STACKS=<seconds>,...` | Prints every thread's stack at those times after start. |
 | `VICTORY_STACKS_FILE=<path>` | Writes those dumps to a file without taking locks, for freezes. |
+| `VICTORY_SKIP_BINK=1` or `=all` | Skips the game's Bink movies. `1` skips the ones that do not loop (logos and intros), and `all` skips the looping menu backgrounds too, which then stay dark. Useful on a slow Mac where the intro takes minutes. |
 | `VICTORY_SKIP_TITLE_INT3=<rva>,...` | Steps over the game's own `int3` asserts at those hex RVAs and logs each one. Every other assert still stops the run. |
 | `VICTORY_GPU_TIMING=1` | Submits and times each GPU list on its own. |
 | `VICTORY_GPU_TIMING_CUTS=sweep` | GPU time per pipeline on a Mac, where GPU timestamps read 0: a few pipelines at a time get host lists of their own, timed by the clock, round all of them in a few minutes. `=<hash>,...` times the pipelines of those shaders only. Diagnostics builds. |
