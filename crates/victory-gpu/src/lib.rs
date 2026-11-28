@@ -105,6 +105,8 @@ mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod census;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;
