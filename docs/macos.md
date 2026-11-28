@@ -314,13 +314,13 @@ The title takes its output size from its own settings (`settings.xml`, `video/re
 
 ## A/B benchmarks that the noise does not drown
 
-Single game runs vary by about 20 % (where the camera looks, streaming, heat), more than most changes gain. `tools/macos/bench-ab.sh` runs two switch sets at the same spot, interleaved (A B A B ...), each a full start in benchmark mode: `VICTORY_BENCH_WARMUP` world frames (120) are skipped, `VICTORY_BENCH_EXIT_FRAMES` (300) are measured, and the game exits and writes a `VICTORY_BENCH_OUT` report. `VICTORY_INPUT_REPLAY` gives every run the same input by world frame; `tools/macos/bench/stand-still.jsonl` keeps the player still where the save loads. `VICTORY_KEYS` still steers the menus into the world. One unmeasured run first fills the shader caches; with `VICTORY_PREWARM` set, they are prewarmed.
+Single game runs vary by about 20 % (where the camera looks, streaming, heat), more than most changes gain. `tools/macos/bench-ab.sh` runs two switch sets at the same spot, interleaved (A B A B ...), each a full start in benchmark mode: `VICTORY_BENCH_WARMUP` world frames (120) are skipped, `VICTORY_BENCH_EXIT_FRAMES` (300) are measured, and the game exits and writes a `VICTORY_BENCH_OUT` report. `VICTORY_INPUT_REPLAY` gives every run the same input by world frame; `tools/macos/bench/stand-still.json` keeps the player still where the save loads. `VICTORY_KEYS` still steers the menus into the world. One unmeasured run first fills the shader caches; with `VICTORY_PREWARM` set, they are prewarmed.
 
 ```bash
 tools/macos/bench-ab.sh --exe <game executable> --a "VICTORY_TWIN_UAV_READS=0" --b "VICTORY_TWIN_UAV_READS=1" --runs 4
 ```
 
-It ends with `tools/macos/bench-compare.py <dir>`: each run's median frame time, each side's median, B - A, and a bootstrap 95 % interval of it. An interval that holds 0 means those runs cannot tell A from B; add runs. Reports and logs are in `target/bench/<date>`.
+It ends with `cargo xtask bench-compare <dir>`: each run's median frame time, each side's median, B - A, and a bootstrap 95 % interval of it. An interval that holds 0 means those runs cannot tell A from B; add runs. Reports and logs are in `target/bench/<date>`.
 
 ## Optional switches for slow storage, low memory and speed
 

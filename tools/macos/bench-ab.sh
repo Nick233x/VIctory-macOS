@@ -12,12 +12,12 @@
 #       --a "VICTORY_TWIN_UAV_READS=0" --b "VICTORY_TWIN_UAV_READS=1" \
 #       [--runs 4] [--frames 300] [--warmup 120] [--replay <jsonl>] [--out <dir>]
 #
-# Then: python3 -I tools/macos/bench-compare.py <out dir>
+# Then: cargo xtask bench-compare <out dir>
 set -eu
 cd "$(dirname "$0")/../.."
 root="$PWD"
 exe="" a="" b="" runs=4 frames=300 warmup=120
-replay="$root/tools/macos/bench/stand-still.jsonl"
+replay="$root/tools/macos/bench/stand-still.json"
 out="$root/target/bench/$(date +%Y%m%d-%H%M%S)"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -60,4 +60,4 @@ while [ "$i" -le "$runs" ]; do
     i=$((i + 1))
 done
 echo "reports in $out"
-python3 -I tools/macos/bench-compare.py "$out"
+cargo xtask bench-compare "$out"
