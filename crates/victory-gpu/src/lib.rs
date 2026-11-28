@@ -108,6 +108,8 @@ mod texture;
 #[cfg(any(windows, test))]
 mod timing_cuts;
 #[cfg(windows)]
+mod census;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;

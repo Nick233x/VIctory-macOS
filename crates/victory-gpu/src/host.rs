@@ -6623,6 +6623,7 @@ impl Meter {
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
             crate::twin::log(report_frames);
+            crate::census::log(report_frames);
             crate::draw::table_memo_line(report_frames);
             // How long the threads that ran held work were held by it: a
             // title thread waits there instead of going on with its frame.
