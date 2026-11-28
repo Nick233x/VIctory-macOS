@@ -1966,7 +1966,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         TEST_PAUSE_LANDING.store(true, Ordering::Release);
         host.execute_flight1(vec![quiet_copy(host, 0x1111_0001, &out1)], vec![]);
         assert!(host.attach_signal(f1, 1, false));
-        assert_eq!(flights_in_air(host), 1);
+        // Another test's synchronous submission may land it at once: then
+        // this attempt does not take the path (`until_taken`).
+        let first_in_air = flights_in_air(host) == 1;
 
         // SAFETY: valid title buffer.
         unsafe { title_ptr.cast::<u32>().write_volatile(0x2222_0002) };
@@ -1981,7 +1983,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(host.attach_signal(f2, 1, false));
 
         let after = ahead_counts();
-        let taken = after[0] - before[0] == 1 && after[1] - before[1] == 1 && flights_in_air(host) == 2;
+        let taken = first_in_air
+            && after[0] - before[0] == 1
+            && after[1] - before[1] == 1
+            && flights_in_air(host) == 2;
 
         TEST_PAUSE_LANDING.store(false, Ordering::Release);
         let start = Instant::now();
@@ -2342,11 +2347,18 @@ void main(uint3 id : SV_DispatchThreadID) {
             [Probe::Behind, Probe::RangesOnly, Probe::CleanKnown, Probe::Ceiling]
                 .map(|p| after[slot(p)] - before[slot(p)])
         };
-        let [behind, ranges, clean, ceiling] = round(b, &sb);
-        assert_eq!((behind, ranges), (1, 1), "compared behind a flight with declared writes only");
+        // Another test's flight landing between the two (the last landed is
+        // the process's) leaves a round uncompared: it runs again.
+        let compared = |refreshed: u64, shadow: &Arc<crate::shadow::Shadow>| {
+            (0..20)
+                .map(|_| round(refreshed, shadow))
+                .find(|counts| counts[0] == 1)
+                .expect("another test's flight landed between the two every time")
+        };
+        let [_, ranges, clean, ceiling] = compared(b, &sb);
+        assert_eq!(ranges, 1, "compared behind a flight with declared writes only");
         assert_eq!((clean, ceiling), (1, 1), "another copy: could go ahead");
-        let [behind, _, clean, ceiling] = round(a, &sa);
-        assert_eq!(behind, 1);
+        let [_, _, clean, ceiling] = compared(a, &sa);
         assert_eq!((clean, ceiling), (0, 0), "the range it wrote: could not");
         drop((sa, sb));
         // SAFETY: the flights have landed.

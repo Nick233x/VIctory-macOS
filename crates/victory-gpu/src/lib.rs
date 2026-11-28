@@ -96,6 +96,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiled;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
@@ -121,8 +123,10 @@ mod inplace_probe;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use alias::{Unaliased, alias_region, enabled as alias_buffers, note_unaliased, unalias_region};
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use alias::{PhysicalHeap, physical_heap};
+#[cfg(windows)]
+pub use alias::{PhysicalHeap, Tile, physical_heap, physical_tiles};
+#[cfg(windows)]
+pub use tiled::{on_physical_tiles, physical_retiled};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]

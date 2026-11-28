@@ -24,7 +24,6 @@ use crate::host::host;
 use crate::watch::PAGE;
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
-#[cfg(any(test, feature = "diagnostics"))]
 use windows::Win32::Graphics::Direct3D12::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -360,7 +359,6 @@ fn supported() -> Option<bool> {
 
 /// CPU-visible backing for XMem physical pages. The placed buffer keeps a
 /// CPU mapping of the heap from which reserved resources can take tiles.
-#[cfg(any(test, feature = "diagnostics"))]
 pub struct PhysicalHeap {
     backing: ID3D12Resource,
     // A placed buffer must keep its heap alive.
@@ -369,7 +367,6 @@ pub struct PhysicalHeap {
     len: usize,
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl PhysicalHeap {
     pub(crate) fn new(device: &ID3D12Device, len: usize) -> windows::core::Result<Self> {
         let desc = D3D12_HEAP_DESC {
@@ -459,7 +456,6 @@ impl PhysicalHeap {
     }
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl Drop for PhysicalHeap {
     fn drop(&mut self) {
         // SAFETY: unmapped once, while the placed buffer still owns the view.
@@ -467,11 +463,61 @@ impl Drop for PhysicalHeap {
     }
 }
 
-/// Allocates CPU-visible physical tiles for the Rosetta diagnostics trial.
-#[cfg(feature = "diagnostics")]
-pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
+/// Whether the title's physical pages are GPU memory
+/// (`VICTORY_PHYSICAL_TILES=1`, off by default; Rosetta and D3DMetal only):
+/// each section of them is a CPU-visible heap, its title views remapped
+/// onto it ([`PhysicalHeap::alias_view`]), and host copies of title buffers
+/// on those pages read them in place (`crate::tiled`).
+pub fn physical_tiles() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PHYSICAL_TILES.with(std::cell::Cell::get) {
+        return on && supported().is_some();
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| crate::switch::on("VICTORY_PHYSICAL_TILES") && supported().is_some())
+    *ENABLED.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_PHYSICAL_TILES") && supported().is_some();
+        if on {
+            tracing::info!("the title's physical pages are GPU memory, read in place (VICTORY_PHYSICAL_TILES=1)");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`physical_tiles`] on this test's thread.
+    pub(crate) static TEST_PHYSICAL_TILES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// One 64 KiB tile of a [`PhysicalHeap`]: a host copy's reserved buffer maps
+/// it (`crate::tiled`), holding the heap while it does.
+#[derive(Clone)]
+pub struct Tile {
+    pub(crate) heap: ID3D12Heap,
+    pub(crate) index: u32,
+}
+
+impl Tile {
+    /// Its 64 KiB tile in its heap.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+impl PhysicalHeap {
+    /// The tile at byte `offset` of the heap.
+    pub fn tile(&self, offset: usize) -> Option<Tile> {
+        (offset.is_multiple_of(PAGE) && offset < self.len).then(|| Tile {
+            heap: self._heap.clone(),
+            index: (offset / PAGE) as u32,
+        })
+    }
+}
+
+/// CPU-visible GPU memory for a section of the title's physical pages, of
+/// `len` bytes ([`physical_tiles`]); none when off or not made.
+pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
+    if !physical_tiles()
         || len == 0
         || !len.is_multiple_of(PAGE)
     {

@@ -3379,7 +3379,7 @@ impl Host {
     }
 
     /// The queue submissions go to now.
-    fn queue(&self) -> ID3D12CommandQueue {
+    pub(crate) fn queue(&self) -> ID3D12CommandQueue {
         self.queue.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -8989,5 +8989,132 @@ mod waiting_on_tests {
             let taken = started.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
             println!("{per} pipelines a list: names {copied:.1} us, sets {taken:.2} us ({total})");
         }
+    }
+}
+
+/// `VICTORY_PHYSICAL_TILES=1`: a title buffer on physical pages that are GPU
+/// memory is read in place (`crate::tiled`).
+#[cfg(test)]
+mod tiled_tests {
+    use crate::alias::{PhysicalHeap, Tile};
+    use crate::backend::{HostGpu, HostMemory};
+    use crate::watch::PAGE;
+    use std::sync::Mutex;
+
+    /// What the test's "runtime" maps: page address and its tile.
+    static SHOWN: Mutex<Vec<(usize, Tile)>> = Mutex::new(Vec::new());
+
+    fn lookup(at: usize, len: usize, out: &mut Vec<Option<Tile>>) -> bool {
+        let shown = SHOWN.lock().unwrap();
+        out.clear();
+        out.extend((at / PAGE..(at + len).div_ceil(PAGE)).map(|page| {
+            shown.iter().find(|(a, _)| *a == page * PAGE).map(|(_, t)| t.clone())
+        }));
+        true
+    }
+
+    /// Title memory of four pages showing heap tiles 2, 0, 3, 1 in turn.
+    #[test]
+    fn a_buffer_on_gpu_physical_pages_is_read_and_written_in_place() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let _mode = super::flight::ModeGuard::new(false, false);
+        crate::alias::TEST_PHYSICAL_TILES.with(|c| c.set(Some(true)));
+        if !crate::alias::physical_tiles() {
+            crate::alias::TEST_PHYSICAL_TILES.with(|c| c.set(None));
+            return; // not Rosetta and D3DMetal
+        }
+        crate::tiled::on_physical_tiles(lookup);
+        let heap = PhysicalHeap::new(&host.device, 4 * PAGE).expect("a CPU-visible heap");
+        // SAFETY: a fresh reservation of four pages, never freed (its
+        // addresses stay the test's).
+        let at = unsafe {
+            windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                windows_sys::Win32::System::Memory::MEM_RESERVE | windows_sys::Win32::System::Memory::MEM_COMMIT,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        let order = [2usize, 0, 3, 1];
+        for (k, &tile) in order.iter().enumerate() {
+            // SAFETY: our reservation's page and the heap's tile.
+            assert!(unsafe { heap.alias_view(at + k * PAGE, tile * PAGE, PAGE) }, "remap page {k}");
+            SHOWN.lock().unwrap().push((at + k * PAGE, heap.tile(tile * PAGE).unwrap()));
+        }
+        // The title writes each page through its own address.
+        for k in 0..4 {
+            // SAFETY: mapped read-write.
+            unsafe { ((at + k * PAGE) as *mut u32).write_volatile(0x1000 + k as u32) };
+        }
+        let resource = 0x7e57_0000_usize;
+        crate::shadow::register(resource, at as u64, (4 * PAGE) as u64);
+        let copy = crate::shadow::find(at as u64, (4 * PAGE) as u64).expect("a copy");
+        assert!(copy.is_aliased(), "the copy reads the pages in place");
+
+        // The GPU reads what the title wrote, with no refresh.
+        let (out, out_ptr) = host.mapped_buffer(64, true).expect("readback");
+        let read = |page: usize| {
+            // SAFETY: mapped readback memory, no copy into it in flight.
+            unsafe { out_ptr.cast::<u32>().write_volatile(0xDEAD_DEAD) };
+            let list = host.new_list().unwrap();
+            // SAFETY: open list, live buffers.
+            unsafe { list.list.CopyBufferRegion(&out, 0, &copy.buffer, copy.offset((at + page * PAGE) as u64), 4) };
+            list.keep(&out);
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the copy has run.
+            unsafe { out_ptr.cast::<u32>().read_volatile() }
+        };
+        for k in 0..4 {
+            assert_eq!(read(k), 0x1000 + k as u32, "page {k} as the GPU reads it");
+        }
+        // What the GPU writes the title reads at once.
+        let (src, src_ptr) = host.upload_buffer(64).expect("upload");
+        // SAFETY: mapped upload memory.
+        unsafe { src_ptr.cast::<u32>().write_volatile(0xBEEF) };
+        let list = host.new_list().unwrap();
+        // SAFETY: open list, live buffers.
+        unsafe { list.list.CopyBufferRegion(&copy.buffer, copy.offset((at + 2 * PAGE + 8) as u64), &src, 0, 4) };
+        list.keep(&src);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { ((at + 2 * PAGE + 8) as *const u32).read_volatile() }, 0xBEEF);
+
+        // The title maps tile 3 at its second page as well: the copy follows.
+        // SAFETY: as above.
+        assert!(unsafe { heap.alias_view(at + PAGE, 3 * PAGE, PAGE) });
+        crate::tiled::physical_retiled(at + PAGE, PAGE, &[heap.tile(3 * PAGE)]);
+        assert_eq!(read(1), 0x1002, "the second page shows tile 3 now");
+        // Unmapped, it reads zeros (D3DMetal ignores null tile mappings: a
+        // tile of zeros stands in), and the other pages are as they were.
+        crate::tiled::physical_retiled(at + PAGE, PAGE, &[None]);
+        assert_eq!(read(1), 0, "an unmapped page reads zeros");
+        assert_eq!([read(0), read(3)], [0x1000, 0x1003]);
+
+        crate::shadow::unregister(resource, at as u64);
+        SHOWN.lock().unwrap().clear();
+        crate::alias::TEST_PHYSICAL_TILES.with(|c| c.set(None));
+    }
+
+    /// A buffer with a page that is not GPU memory is copied as before.
+    #[test]
+    fn a_buffer_off_gpu_pages_is_copied() {
+        if super::host().is_none() {
+            return;
+        }
+        crate::alias::TEST_PHYSICAL_TILES.with(|c| c.set(Some(true)));
+        crate::tiled::on_physical_tiles(lookup);
+        let p = crate::watch::tests::pool(2);
+        crate::shadow::register(p, p as u64, (2 * PAGE) as u64);
+        let copy = crate::shadow::find(p as u64, (2 * PAGE) as u64).expect("a copy");
+        assert!(!copy.is_aliased());
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+        crate::alias::TEST_PHYSICAL_TILES.with(|c| c.set(None));
     }
 }
