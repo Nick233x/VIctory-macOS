@@ -1603,13 +1603,14 @@ fn lds_in_a_loop_in_halves_matches_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// `v_permlanex16_b32 v1, v0, s8, s9` with the FI and BOUND_CTRL bits
+/// `v_permlane16_b32` or `v_permlanex16_b32` with the FI and BOUND_CTRL bits
 /// (`op_sel` bits 0 and 1, word bits 11 and 12): lane `l` takes the value
-/// of `v0` from the other row of 16 in its 32-lane half, the lane its
-/// nibble of `s8` (lanes 0 to 7 of a row) or `s9` (lanes 8 to 15) names.
-const fn permlanex16(fetch_inactive: bool, bound_ctrl: bool) -> [u32; 2] {
+/// of `v0` from its own row of 16 (or the other row of its half), the lane
+/// its nibble of `s8` (lanes 0 to 7) or `s9` (lanes 8 to 15) names.
+const fn permlane16(other_row: bool, fetch_inactive: bool, bound_ctrl: bool) -> [u32; 2] {
+    let opcode = if other_row { 0xD778_0001 } else { 0xD777_0001 };
     [
-        0xD778_0001 | (fetch_inactive as u32) << 11 | (bound_ctrl as u32) << 12,
+        opcode | (fetch_inactive as u32) << 11 | (bound_ctrl as u32) << 12,
         0x0024_1100,
     ]
 }
@@ -1619,15 +1620,18 @@ const PERM_LOW: u32 = 0x1357_9BDF;
 const PERM_HIGH: u32 = 0x2468_ACE0;
 /// What `v1` holds before an instruction that may leave it alone.
 const PERM_OLD: u32 = 0xAAAA;
+/// Keep arbitrary high bits in the same-row fixture's source data.
+const PERM_PAYLOAD: u32 = 0xDEAD_BE00;
 
-/// Per lane `l` of one console wave of `lanes`: `v0` (the lane's number)
-/// permuted with every lane active, then with only the even lanes active
-/// for FI clear and BOUND_CTRL clear, FI clear and BOUND_CTRL set, FI set
-/// and BOUND_CTRL clear, and FI and BOUND_CTRL both set, each over a `v1`
+/// Per workgroup lane: `v0` (its thread id, or a raw value made from the
+/// workgroup and thread ids for the same-row form), permuted first with all
+/// lanes active, then with only even lanes active and every FI/BOUND_CTRL
+/// combination. The same-row form also checks full EXEC with BOUND_CTRL
+/// set. Each masked or potentially out-of-bounds read starts with `v1`
 /// holding [`PERM_OLD`]. EXEC is whole again for every store.
 #[cfg(windows)]
-fn permlanex16_program(lanes: u32) -> Vec<u32> {
-    let wave64 = lanes == 64;
+fn permlane16_program(lanes: u32, other_row: bool) -> Vec<u32> {
+    let wave64 = lanes > 32;
     let full = |w: &mut Vec<u32>| {
         w.push(if wave64 {
             0xBEFE_04C1 // s_mov_b64 exec, -1
@@ -1643,8 +1647,18 @@ fn permlanex16_program(lanes: u32) -> Vec<u32> {
         });
     };
     let mut w = PROLOGUE.to_vec();
+    if other_row {
+        w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
+    } else {
+        w.extend([
+            0x8F02_8801, // s_lshl_b32 s2, s1 (group id X), 8
+            0x4A22_0002, // v_add_nc_u32 v17, s2, v0
+            0x3420_2285, // v_lshlrev_b32 v16, 5, v17
+            0x3A00_22FF,
+            PERM_PAYLOAD, // v_xor_b32 v0, PERM_PAYLOAD, v17
+        ]);
+    }
     w.extend([
-        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
         0xBE88_03FF,
         PERM_LOW, // s_mov_b32 s8, PERM_LOW
         0xBE89_03FF,
@@ -1654,7 +1668,10 @@ fn permlanex16_program(lanes: u32) -> Vec<u32> {
         0xBE8B_03FF,
         0x5555_5555, // s_mov_b32 s11, 0x55555555
     ]);
-    w.extend(permlanex16(false, false));
+    if !other_row {
+        w.extend([0x7E02_02FF, PERM_OLD]); // v_mov_b32 v1, PERM_OLD
+    }
+    w.extend(permlane16(other_row, false, false));
     w.extend(store(1, 0));
     for (slot, (fi, bc)) in [(false, false), (false, true), (true, false), (true, true)]
         .into_iter()
@@ -1662,43 +1679,64 @@ fn permlanex16_program(lanes: u32) -> Vec<u32> {
     {
         w.extend([0x7E02_02FF, PERM_OLD]); // v_mov_b32 v1, PERM_OLD
         even(&mut w);
-        w.extend(permlanex16(fi, bc));
+        w.extend(permlane16(other_row, fi, bc));
         full(&mut w);
         w.extend(store(1, 4 * (slot as u32 + 1)));
+    }
+    if !other_row {
+        w.extend([0x7E02_02FF, PERM_OLD]); // v_mov_b32 v1, PERM_OLD
+        w.extend(permlane16(false, false, true));
+        w.extend(store(1, 20));
     }
     w.push(S_ENDPGM);
     w
 }
 
-/// What the console gives [`permlanex16_program`]'s lane `l`.
-fn permlanex16_console(l: u32) -> [u32; 5] {
-    let in_row = l & 15;
+/// What the console gives [`permlane16_program`]'s lane `l`. An FI read
+/// from a lane that was never launched has no documented input value.
+fn permlane16_console(l: u32, group: u32, threads: u32, other_row: bool) -> [Option<u32>; 6] {
+    let in_row = l % 16;
     let selectors = if in_row >= 8 { PERM_HIGH } else { PERM_LOW };
-    let source = (l & !15 ^ 16) | (selectors >> (4 * (in_row & 7)) & 15);
+    let row = if other_row { (l / 16) ^ 1 } else { l / 16 };
+    let source = row * 16 + ((selectors >> (4 * (in_row % 8))) & 15);
+    let value = if other_row {
+        source
+    } else {
+        (256 * group + source) ^ PERM_PAYLOAD
+    };
     let active = |lane: u32| lane.is_multiple_of(2);
-    let with_exec = |inactive_source: u32, fetch_inactive: bool| {
-        if !active(l) {
-            PERM_OLD
-        } else if fetch_inactive || active(source) {
-            source
+    let result = |masked: bool, fi: bool, bc: bool| {
+        if masked && !active(l) {
+            Some(PERM_OLD)
+        } else if fi {
+            (source < threads).then_some(value)
+        } else if source < threads && (!masked || active(source)) {
+            Some(value)
+        } else if bc {
+            Some(0)
         } else {
-            inactive_source
+            Some(PERM_OLD)
         }
     };
     [
-        source,
-        with_exec(PERM_OLD, false),
-        with_exec(0, false),
-        with_exec(PERM_OLD, true),
-        with_exec(0, true),
+        result(false, false, false),
+        result(true, false, false),
+        result(true, false, true),
+        result(true, true, false),
+        result(true, true, true),
+        result(false, false, true),
     ]
 }
 
 /// The hand-encoded words are the instructions their comments name.
 #[test]
-fn the_permlanex16_program_is_what_its_comments_say() {
-    let mut names = Vec::new();
-    for words in [permlanex16(false, false), permlanex16(true, true)] {
+fn the_permlane16_programs_are_what_their_comments_say() {
+    for (words, opcode) in [
+        (permlane16(true, false, false), "v_permlanex16_b32"),
+        (permlane16(true, true, true), "v_permlanex16_b32"),
+        (permlane16(false, false, false), "v_permlane16_b32"),
+        (permlane16(false, true, true), "v_permlane16_b32"),
+    ] {
         let p = ir::build(
             &[words[0], words[1], S_ENDPGM]
                 .iter()
@@ -1708,16 +1746,8 @@ fn the_permlanex16_program_is_what_its_comments_say() {
             32,
         )
         .expect("ir::build");
-        names.push(
-            p.blocks[0]
-                .insts
-                .iter()
-                .map(|i| i.name().to_string())
-                .collect::<Vec<_>>(),
-        );
+        assert_eq!(p.blocks[0].insts[0].name(), opcode);
     }
-    assert_eq!(names[0][0], "v_permlanex16_b32");
-    assert_eq!(names[1][0], "v_permlanex16_b32");
 }
 
 /// The lanes of each row read the other row of their 32-lane half through
@@ -1729,10 +1759,17 @@ fn the_permlanex16_program_is_what_its_comments_say() {
 fn permlanex16_picks_lanes_as_the_console_does_on_every_gpu() {
     let mut failed = Vec::new();
     for lanes in [32, 64] {
-        let want: Vec<u32> = (0..lanes).flat_map(permlanex16_console).collect();
+        let want: Vec<u32> = (0..lanes)
+            .flat_map(|l| {
+                permlane16_console(l, 0, lanes, true)
+                    .into_iter()
+                    .take(5)
+                    .map(|value| value.expect("full cross-row fixtures"))
+            })
+            .collect();
         failed.extend(differences_in(
             lanes == 64,
-            &permlanex16_program(lanes),
+            &permlane16_program(lanes, true),
             lanes,
             5,
             &want,
@@ -1744,18 +1781,167 @@ fn permlanex16_picks_lanes_as_the_console_does_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// The model itself: lane 0 reads lane 16 | 15 (the low nibble of `s8` is
-/// 15, an odd and so inactive lane), lane 8 reads 16 | 0 (the low nibble of `s9`), the second half's
-/// lane 32 reads 48 | 15, and FI and BOUND_CTRL change only what an
-/// inactive source gives.
+/// Lane 0 selects an odd lane (nibble 15) and lane 8 selects an even lane
+/// (nibble 0). Lane 32 stays in the same half for either row choice.
 #[test]
-fn the_permlanex16_model_follows_the_instruction() {
-    assert_eq!(permlanex16_console(0), [31, 0xAAAA, 0, 31, 31]);
-    assert_eq!(permlanex16_console(8), [16, 16, 16, 16, 16]);
-    assert_eq!(permlanex16_console(1), [29, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA]);
-    assert_eq!(permlanex16_console(16)[0], 15);
-    assert_eq!(permlanex16_console(32)[0], 63);
-    assert_eq!(permlanex16_console(48)[0], 47);
+fn the_permlane16_model_follows_the_instructions() {
+    assert_eq!(
+        permlane16_console(0, 0, 64, true),
+        [31, PERM_OLD, 0, 31, 31, 31].map(Some)
+    );
+    assert_eq!(permlane16_console(8, 0, 64, true), [Some(16); 6]);
+    assert_eq!(
+        permlane16_console(1, 0, 64, true),
+        [29, PERM_OLD, PERM_OLD, PERM_OLD, PERM_OLD, 29].map(Some)
+    );
+    assert_eq!(permlane16_console(16, 0, 64, true)[0], Some(15));
+    assert_eq!(permlane16_console(32, 0, 64, true)[0], Some(63));
+    assert_eq!(permlane16_console(48, 0, 64, true)[0], Some(47));
+    assert_eq!(
+        permlane16_console(0, 0, 64, false),
+        [
+            0xDEAD_BE0F,
+            PERM_OLD,
+            0,
+            0xDEAD_BE0F,
+            0xDEAD_BE0F,
+            0xDEAD_BE0F
+        ]
+        .map(Some)
+    );
+    assert_eq!(permlane16_console(8, 0, 64, false), [Some(PERM_PAYLOAD); 6]);
+    assert_eq!(permlane16_console(32, 1, 64, false)[0], Some(0xDEAD_BF2F));
+    assert_eq!(
+        permlane16_console(64, 0, 79, false),
+        [Some(PERM_OLD), Some(PERM_OLD), Some(0), None, None, Some(0)]
+    );
+}
+
+fn same_row_permlane16_native(threads: u32) -> NativeProgram {
+    let words = permlane16_program(threads, false);
+    let mut n = native(&words, threads > 32, threads, 0);
+    let StageIo::Cs(cs) = &mut n.io else {
+        unreachable!()
+    };
+    cs.rsrc2 |= 1 << 7; // group id X in s1, after the user-data SGPR
+    n
+}
+
+#[test]
+fn same_row_permlane16_uses_host_lanes_without_an_exchange() {
+    let n = same_row_permlane16_native(64);
+    let l = super::with_thread_ticket(false, || lowered(&n, true))
+        .expect("a live same-row permute lowers in wave64 halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.uses_lane_index);
+    assert_eq!(l.barriers, 0);
+}
+
+/// The last 16-lane row is complete at 80 and 112 threads. At 79 threads
+/// some selectors name the missing lane. Check both BOUND_CTRL outcomes
+/// for those reads with FI clear.
+#[test]
+#[cfg(windows)]
+fn same_row_permlane16_matches_the_console_on_hardware() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts = Host::each_hardware();
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 hardware device; skipped same-row permlane16");
+        return;
+    }
+    let workgroups = 3;
+    let mut completed = 0;
+    let mut checked_lanes = 0;
+    let mut checked_dwords = 0;
+    for (adapter, host) in &hosts {
+        for threads in [32, 64, 79, 80, 96, 112, 128, 256] {
+            let n = same_row_permlane16_native(threads);
+            let bytes = crate::dxbc::build(&[]);
+            let container = crate::dxbc::Container::parse(&bytes).expect("empty test container");
+            let (p, st) =
+                crate::range::build(&n.patched_code(), n.wave64, n.vgprs).expect("range::build");
+            let st = st.expect("structure");
+            let res = resource::track(&p, &n.layout, n.stage, Some(&st)).expect("track");
+            let io = io::raise(&p, &n).expect("io::raise");
+            let shader = super::emit_with(
+                &container,
+                &n,
+                &p,
+                &st,
+                &io,
+                &res,
+                super::Options {
+                    host_wave32: true,
+                    narrow_waves: true,
+                    ..Default::default()
+                },
+            )
+            .expect("production translation of same-row permlane16");
+            let label = format!("{adapter}: {threads} threads");
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut shader.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{label}: DXIL validation: {e}"));
+            }
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: pipeline creation: {e}"));
+            let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[
+                            View::Texture(1, 1, &[[0.0; 4]]),
+                            View::Buffer {
+                                data: &[0; 4],
+                                stride: Stride::Structured(16),
+                            },
+                            View::RawUav(workgroups * 256 * 8),
+                        ],
+                        samplers: &[],
+                        groups: [workgroups, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out.len(), 1, "{label}: readback UAV count");
+            assert_eq!(
+                out[0].len(),
+                (workgroups * 256 * 8) as usize,
+                "{label}: readback length"
+            );
+            for group in 0..workgroups {
+                for lane in 0..threads {
+                    let offset = ((group * 256 + lane) * 8) as usize;
+                    for (slot, expected) in permlane16_console(lane, group, threads, false)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if let Some(expected) = expected {
+                            assert_eq!(
+                                out[0][offset + slot],
+                                expected,
+                                "{label}: workgroup {group}, lane {lane}, slot {slot}"
+                            );
+                            checked_dwords += 1;
+                        }
+                    }
+                }
+            }
+            completed += 1;
+            checked_lanes += threads * workgroups;
+            eprintln!("{label}: pipeline created, {workgroups} workgroups completed and checked");
+        }
+    }
+    assert!(completed > 0 && checked_lanes > 0 && checked_dwords > 0);
+    eprintln!(
+        "same-row permlane16: {completed} hardware dispatches, {checked_lanes} lanes and {checked_dwords} defined dwords checked"
+    );
 }
 
 /// A single result in v3, stored after the body restores EXEC.
@@ -4268,6 +4454,55 @@ fn mac_read_in_a_region(mask_words: &[u32], per_lane: bool) -> Vec<u32> {
     w
 }
 
+/// A register-index waterfall as the console compiler writes one for a
+/// per-lane `v[3 + index]`: `v3..v10` hold `k * 1000 + thread id`, the index
+/// is `(thread id >> 2) & 7`, and the loop reads one index left
+/// (`v_readfirstlane_b32 s38, v28`), runs the lanes holding it with
+/// `m0 = s38` and `v_movrels_b32 v31, v3`, drops them, and loops while any
+/// lane is left. Every lane stores `v31`: `index * 1000 + thread id`.
+/// `with_mbcnt` asks for console lanes as well (so the program runs in
+/// halves); `after` is put after the loop, `body` before the loop's
+/// `s_xor_b64`.
+fn index_waterfall(with_mbcnt: bool, body: &[u32], after: &[u32]) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
+    if with_mbcnt {
+        w.extend([
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        ]);
+    }
+    for k in 0..8u32 {
+        // v_add_nc_u32 v(3 + k), k * 1000, v0
+        w.extend([0x4A00_00FF | (3 + k) << 17, k * 1000]);
+    }
+    w.extend([
+        0x2C38_0082, // v_lshrrev_b32 v28, 2, v0
+        0x3638_3887, // v_and_b32 v28, 7, v28
+        0xBEA4_047E, // s_mov_b64 s[36:37], exec
+    ]);
+    let looped = [
+        &[
+            0x7E4C_051C, // v_readfirstlane_b32 s38, v28
+            0x7D84_3826, // v_cmp_eq_u32 vcc, s38, v28
+            0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+            0xBEFC_0326, // s_mov_b32 m0, s38
+            0x7E3E_8703, // v_movrels_b32 v31, v3
+        ][..],
+        body,
+        &[0x89FE_067E], // s_xor_b64 exec, exec, s[6:7]
+    ]
+    .concat();
+    let back = -(looped.len() as i32 + 1);
+    w.extend(&looped);
+    w.push(0xBF89_0000 | (back as u32 & 0xFFFF)); // s_cbranch_execnz (the read)
+    w.push(0xBEFE_0424); // s_mov_b64 exec, s[36:37]
+    w.extend(after);
+    w.extend(store(31, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 #[test]
 fn the_mac_read_programs_are_what_their_comments_say() {
     for per_lane in [false, true] {
@@ -4358,6 +4593,88 @@ fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu()
                         .map(|m| format!("{label}(per_lane={per_lane}) {threads} threads: {m}")),
                 );
             }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+
+#[test]
+fn the_index_waterfall_programs_are_what_their_comments_say() {
+    let words = index_waterfall(true, &[], &[]);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_add_nc_u32 v3, lit(0x00000000), v0",
+        "v_add_nc_u32 v10, lit(0x00001b58), v0",
+        "v_lshrrev_b32 v28, 2, v0",
+        "v_and_b32 v28, 7, v28",
+        "s_mov_b64 s[36:37], exec",
+        "v_readfirstlane_b32 s38, v28",
+        "v_cmp_eq_u32 vcc, s38, v28",
+        "s_and_saveexec_b64 s[6:7], vcc",
+        "s_mov_b32 m0, s38",
+        "v_movrels_b32 v31, v3",
+        "s_xor_b64 exec, exec, s[6:7]",
+        "s_cbranch_execnz",
+        "s_mov_b64 exec, s[36:37]",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// The first-lane read opening a register-index waterfall is made by each
+/// host half by itself: the program needs no halves for it, and translates
+/// in halves too although the read is in a loop (#522 sent GTA VI's
+/// `11eeb27c2d15980d` to halves for it, which refused it). Where the read's
+/// result is seen after the loop, or the loop body does scalar work, whose
+/// iterations the halves would see, the read still takes halves (refused
+/// where they cannot meet).
+#[test]
+fn a_register_index_waterfall_is_made_in_each_half() {
+    let across = "a first-lane read of a value that may differ between 32-lane halves";
+    let halves = |words: &[u32], threads: u32| match lowered(&native(words, true, threads, 0), true)
+    {
+        Ok(l) => l.wave_size == Some(32),
+        Err(e) => e.to_string().contains(across),
+    };
+    for threads in [64, 128] {
+        assert!(!halves(&index_waterfall(false, &[], &[]), threads));
+        assert!(halves(&index_waterfall(true, &[], &[]), threads));
+        // v_mov_b32 v31, s38 after the loop
+        assert!(halves(
+            &index_waterfall(false, &[], &[0x7E3E_0226]),
+            threads
+        ));
+        // s_add_u32 s50, s50, 1 in the body
+        assert!(halves(
+            &index_waterfall(false, &[0x8032_8132], &[]),
+            threads
+        ));
+    }
+}
+
+/// The register-index waterfall gives the console's lanes on every GPU, in
+/// halves and not: `((thread id >> 2) & 7) * 1000 + thread id` in every
+/// lane.
+#[cfg(windows)]
+#[test]
+fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads).map(|t| ((t >> 2) & 7) * 1000 + t).collect();
+        for with_mbcnt in [false, true] {
+            let words = index_waterfall(with_mbcnt, &[], &[]);
+            failed.extend(
+                differences(&words, threads, 1, &want)
+                    .into_iter()
+                    .map(|m| format!("{threads} threads (mbcnt={with_mbcnt}): {m}")),
+            );
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
