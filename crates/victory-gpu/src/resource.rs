@@ -1961,15 +1961,99 @@ pub(crate) fn evict_unused() {
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     let ram = ram_over();
-    evict(frame, now_ms(), over.max(ram));
+    let mut part = EvictClock(std::time::Instant::now());
+    part.lap(EvictPart::Budget);
+    // Read through the heap since the last pass: used (a slot's read mark is
+    // reported as new only once, so its first read alone stamped it; run
+    // evict1 gave up and made again hundreds of textures a frame).
+    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
+    part.lap(EvictPart::ReadMarks);
+    let candidates = candidates();
+    part.lap(EvictPart::Candidates);
+    evict_among(&candidates, &read, frame, now_ms(), over.max(ram));
+    drop(candidates);
+    part.lap(EvictPart::GiveUp);
     empty_sparse_heap(frame);
+    part.lap(EvictPart::SparseHeap);
     // Host copies of title memory take the same memory and textures give
     // back only part of it: the idle ones go too.
     crate::shadow::release_idle(frame, ram);
+    part.lap(EvictPart::IdleCopies);
     crate::shadow::release_stale(frame);
+    part.lap(EvictPart::StaleCopies);
     if over > 0 || ram > 0 {
         crate::texback::trim_idle();
     }
+    part.lap(EvictPart::Trim);
+}
+
+#[cfg(windows)]
+/// The parts of [`evict_unused`] (and the unordered views made again after
+/// it), for the frame report's evicting line: which one the phase's time
+/// is.
+#[derive(Clone, Copy)]
+pub(crate) enum EvictPart {
+    /// The card's budget and the computer's free memory asked.
+    Budget,
+    /// The heap's read marks: which host textures shaders read.
+    ReadMarks,
+    /// The host textures that may be given up, gathered.
+    Candidates,
+    /// Those to give up chosen and given up.
+    GiveUp,
+    /// A sparse heap of textures emptied (every 30 frames).
+    SparseHeap,
+    /// Idle host copies of title memory released.
+    IdleCopies,
+    /// Stale host copies released.
+    StaleCopies,
+    /// Texture readbacks trimmed (past a budget).
+    Trim,
+    /// Unordered views left null made again (`descriptor::remake_unordered`).
+    Remake,
+}
+
+#[cfg(windows)]
+const EVICT_NAMES: [&str; 9] = [
+    "budget asked",
+    "read marks",
+    "candidates",
+    "given up",
+    "sparse heap",
+    "idle copies",
+    "stale copies",
+    "readbacks trimmed",
+    "unordered views made again",
+];
+
+#[cfg(windows)]
+/// [`EVICT_NAMES`]' nanoseconds since the last frame report.
+static EVICT_PARTS: [std::sync::atomic::AtomicU64; EVICT_NAMES.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; EVICT_NAMES.len()];
+
+#[cfg(windows)]
+/// Adds each part's time to [`EVICT_PARTS`] as the next one starts.
+pub(crate) struct EvictClock(pub(crate) std::time::Instant);
+
+#[cfg(windows)]
+impl EvictClock {
+    pub(crate) fn lap(&mut self, part: EvictPart) {
+        let now = std::time::Instant::now();
+        EVICT_PARTS[part as usize].fetch_add((now - self.0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.0 = now;
+    }
+}
+
+#[cfg(windows)]
+/// The frame report's evicting line: each part's milliseconds per frame.
+pub(crate) fn log_evicting(frames: f64) {
+    let ns = EVICT_PARTS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
+    if ns.iter().all(|&n| n == 0) {
+        return;
+    }
+    let parts: Vec<String> =
+        EVICT_NAMES.iter().zip(ns).map(|(name, n)| format!("{name} {:.1}", n as f64 / 1e6 / frames)).collect();
+    tracing::info!("host evicting per frame by part, ms: {}", parts.join(", "));
 }
 
 /// Presented frames between two [`empty_sparse_heap`] passes.
@@ -2231,21 +2315,11 @@ fn budget_setting(value: Option<&str>) -> Option<f64> {
 #[cfg(windows)]
 pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
 
-/// Gives up the host textures fed from title memory that the title has
-/// not used for [`IDLE_MS`] and [`IDLE_FRAMES`] at (`frame`, `now` ms),
-/// then least recently used ones until `over` bytes are gone
-/// ([`give_up`]). Returns how many and their bytes.
-#[cfg(windows)]
-fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
-    // Read through the heap since the last pass: used (a slot's read mark is
-    // reported as new only once, so its first read alone stamped it; run
-    // evict1 gave up and made again hundreds of textures a frame).
-    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    evict_among(&candidates(), &read, frame, now, over)
-}
-
-/// [`evict`] among `candidates`, with `read` (raw pointers) the host
-/// textures shaders read through the heap since the last pass.
+/// Gives up, among `candidates`, the host textures the title has not used
+/// for [`IDLE_MS`] and [`IDLE_FRAMES`] at (`frame`, `now` ms), then least
+/// recently used ones until `over` bytes are gone ([`give_up`]), with
+/// `read` (raw pointers) the host textures shaders read through the heap
+/// since the last pass. Returns how many and their bytes.
 #[cfg(windows)]
 pub(crate) fn evict_among(
     candidates: &[Owned],
