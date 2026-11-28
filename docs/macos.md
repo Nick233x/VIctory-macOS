@@ -312,6 +312,16 @@ The title takes its output size from its own settings (`settings.xml`, `video/re
 
 `VICTORY_OUTPUT=<W>x<H>` asks for another of the title's modes, as before. `VICTORY_OUTPUT=0`, or `none`, leaves the title's own size alone, for a run that wants the picture at the size its settings carry. On Windows, without the switch, the title's own size is used as before.
 
+## A/B benchmarks that the noise does not drown
+
+Single game runs vary by about 20 % (where the camera looks, streaming, heat), more than most changes gain. `tools/macos/bench-ab.sh` runs two switch sets at the same spot, interleaved (A B A B ...), each a full start in benchmark mode: `VICTORY_BENCH_WARMUP` world frames (120) are skipped, `VICTORY_BENCH_EXIT_FRAMES` (300) are measured, and the game exits and writes a `VICTORY_BENCH_OUT` report. `VICTORY_INPUT_REPLAY` gives every run the same input by world frame; `tools/macos/bench/stand-still.jsonl` keeps the player still where the save loads. `VICTORY_KEYS` still steers the menus into the world. One unmeasured run first fills the shader caches; with `VICTORY_PREWARM` set, they are prewarmed.
+
+```bash
+tools/macos/bench-ab.sh --exe <game executable> --a "VICTORY_TWIN_UAV_READS=0" --b "VICTORY_TWIN_UAV_READS=1" --runs 4
+```
+
+It ends with `tools/macos/bench-compare.py <dir>`: each run's median frame time, each side's median, B - A, and a bootstrap 95 % interval of it. An interval that holds 0 means those runs cannot tell A from B; add runs. Reports and logs are in `target/bench/<date>`.
+
 ## Optional switches for slow storage, low memory and speed
 
 None of these changes the default, except `VICTORY_OUTPUT`, which sets the title's output size on a Mac (see above). Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
