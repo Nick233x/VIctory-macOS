@@ -2329,16 +2329,25 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = find_aliased(address, end) {
         return Some(shadow);
     }
-    {
+    let found = {
         let map = buffers_read();
         let Some(key) = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end) else {
             drop(map);
             return loose(address, end);
         };
-        if let Some(shadow) = map.get(&key).and_then(|entry| entry.shadow.clone()) {
-            return Some(shadow);
+        match map.get(&key) {
+            Some(entry) => match &entry.shadow {
+                Some(shadow) => return Some(shadow.clone()),
+                None => Some((key, entry.end - key.0)),
+            },
+            None => None,
         }
-    }
+    };
+    // `VICTORY_PHYSICAL_TILES=1`: a buffer on the title's physical pages
+    // reads them in place. Asked without the buffers' lock: the runtime's
+    // lookup takes its own, which it holds while it tells the trackers of
+    // a mapping (and they may read the buffers).
+    let mut tiled = found.and_then(|(key, len)| Some((key, crate::tiled::make(key.0, len)?)));
     let mut map = buffers();
     let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
     let Some(key) = key else {
@@ -2346,6 +2355,13 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none()
+        && let Some((_, copy)) = tiled.take().filter(|(k, _)| *k == key)
+    {
+        entry.shadow = Some(copy);
+        released().remade(key.0);
+        changed();
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
