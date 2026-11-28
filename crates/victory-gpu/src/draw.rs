@@ -1422,7 +1422,15 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        // To the copy's end in its buffer: `offset` counts from the buffer's start.
+        let (start, len) = shadow.range();
+        host.raw_view_at(
+            index,
+            Some(&shadow.buffer),
+            0,
+            shadow.offset(start + len) & !3,
+            uav,
+        );
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }
@@ -1561,7 +1569,7 @@ impl State {
         // The acceleration-structure builder runs whole or not at all
         // (`pipeline::builder`).
         if crate::pipeline::held_back(self.pipeline as This) {
-            once!("a dispatch of the BVH builder held back: not all its pipelines are made");
+            once!("a dispatch of the BVH builder held back");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -1749,6 +1757,12 @@ impl State {
             list.note_op(|| "the ambient light's pass (VICTORY_AMBIENT)".into());
             self.host_state_lost();
         }
+    }
+
+    /// The title pipeline the next draw or dispatch runs (null: none set).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn title_pipeline(&self) -> usize {
+        self.pipeline
     }
 
     /// Flushes any pending RTV probes recorded during `VICTORY_HDR_PROBE`.
@@ -2773,7 +2787,7 @@ impl State {
         } else {
             // Bounded first: the inline clamp binds a compute pipeline of its
             // own. It reads the count, so that it stops where execution does.
-            let Some(clamped) =
+            let Some((clamped, dst_offset)) =
                 crate::indirect::bound(list, args_gpu, (kind, stride, max), counted)
             else {
                 why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -2783,7 +2797,7 @@ impl State {
             crate::indirect::note_inline(blocker);
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
-            Some(clamped)
+            Some((clamped, dst_offset))
         };
         let ran = match kind {
             DRAW | INDEXED => {
@@ -2800,7 +2814,7 @@ impl State {
             _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
-            if let Some(clamped) = &inline_clamped {
+            if let Some((clamped, _)) = &inline_clamped {
                 crate::indirect::done(list, clamped);
             }
             #[cfg(feature = "diagnostics")]
@@ -2819,7 +2833,7 @@ impl State {
             return Some(false);
         }
         let (clamped, dst_offset, needs_done) = match inline_clamped {
-            Some(clamped) => (clamped, 0, true),
+            Some((clamped, dst_offset)) => (clamped, dst_offset, true),
             None => {
                 let Some((clamped, dst_offset)) =
                     crate::indirect::enqueue(list, args_gpu, (kind, stride, max), counted)
@@ -3188,6 +3202,7 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    mod flight;
     mod tracked_rows;
 
     use super::*;
