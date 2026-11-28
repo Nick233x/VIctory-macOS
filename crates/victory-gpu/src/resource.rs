@@ -1913,11 +1913,18 @@ pub(crate) fn evict_heap_uav() -> bool {
 /// Host copies of title memory nothing asked for in as long go too
 /// ([`crate::shadow::release_stale`]).
 #[cfg(windows)]
+/// The frame [`evict_unused`] last ran in.
+static EVICTED_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether [`evict_unused`] would run now (once per presented frame).
+pub(crate) fn evict_due() -> bool {
+    EVICTED_IN.load(std::sync::atomic::Ordering::Relaxed) != crate::queue::presented()
+}
+
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let frame = crate::queue::presented();
-    if LAST.swap(frame, Relaxed) == frame {
+    if EVICTED_IN.swap(frame, Relaxed) == frame {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
@@ -4136,6 +4143,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        // Synchronous, and not while another test runs Flight-1: what it
+        // checks right after submitting assumes the submission has run.
+        let _mode = crate::host::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -4208,6 +4218,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        // Synchronous, and not while another test runs Flight-1: what it
+        // checks right after submitting assumes the submission has run.
+        let _mode = crate::host::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
