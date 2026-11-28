@@ -206,6 +206,31 @@ pub fn run(
             Err(why) => println!("lookup guard   not applied: {why}"),
         }
     }
+    // The longest step the title's clamped timers take in a
+    // frame, made longer (victory_loader::time_step); off unless asked for.
+    if let Some(seconds) =
+        victory_loader::time_step::wanted(std::env::var(victory_loader::time_step::SWITCH).ok().as_deref())
+    {
+        match victory_loader::time_step::patch(image.base() as u64, seconds) {
+            Ok(step) => println!(
+                "time step      on: the title's clamped timers step up to {step} s a frame (the title's 1/15 s; asked for {seconds})"
+            ),
+            Err(why) => println!("time step      not applied: {why}"),
+        }
+    }
+    // The title's time budget for placing map pieces, made
+    // larger (victory_loader::map_budget); off unless asked for.
+    if let Some(k) = victory_loader::map_budget::wanted(std::env::var(victory_loader::map_budget::SWITCH).ok().as_deref())
+    {
+        match victory_loader::map_budget::patch(image.base() as u64, k) {
+            Ok(()) => println!(
+                "map budget     on: {} to {} us a frame for placing map pieces (the title's limits times {k})",
+                250 * k,
+                1250 * k
+            ),
+            Err(why) => println!("map budget     not applied: {why}"),
+        }
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
