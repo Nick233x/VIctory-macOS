@@ -68,6 +68,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     let io = io::raise(&p, &native).unwrap();
     lower(&Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -127,6 +128,7 @@ fn lower_wave(
     let io = io::raise(&p, &native).unwrap();
     lower(&Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -437,6 +439,7 @@ fn perm_features(selector: u32) -> u64 {
 
     let emitted = lower(&Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -1419,6 +1422,7 @@ fn lowered_result(
     let io = io::raise(&p, &native).unwrap();
     lower(&Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -1651,6 +1655,7 @@ fn lowered_halves(words: &[u32], lanes: u32) -> Result<Lowered, crate::ShaderErr
     let io = io::raise(&p, &native).unwrap();
     lower(&Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -2332,6 +2337,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
         let io = io::raise(&p, &native).unwrap();
         let mut lowered = lower(&Parts {
             halves_rendezvous: false,
+            halves_first_meet: false,
             native: &native,
             p: &p,
             st: &st,
@@ -2432,6 +2438,7 @@ fn lower_ps_for_early_z(
     let io = crate::io::raise(&p, &native).expect("io::raise");
     lower(&Parts {
         halves_rendezvous: false,
+        halves_first_meet: false,
         native: &native,
         p: &p,
         st: &st,
@@ -3237,6 +3244,7 @@ fn lower_halves_io(
     let lowered = crate::emit::with_thread_ticket(false, || {
         lower(&Parts {
             halves_rendezvous: false,
+            halves_first_meet: false,
             native: &native,
             p: &p,
             st: &st,

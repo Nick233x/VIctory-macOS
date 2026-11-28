@@ -579,6 +579,13 @@ pub struct Options {
     /// a read across the halves is refused. The translation differs, so
     /// the shader cache keys on it.
     pub halves_rendezvous: bool,
+    /// With [`Options::halves_rendezvous`]: a first-lane read
+    /// (`v_readfirstlane_b32`) of a value that may differ between the
+    /// halves, in divergent code, meets the other half too (`lower::meet`):
+    /// the console's first active lane is the lower half's first if that
+    /// half has lanes there, else the upper half's. Without it such a read
+    /// is refused. The translation differs, so the shader cache keys on it.
+    pub halves_first_meet: bool,
     /// A compute program of one dimension whose lanes never wait for each
     /// other reads [`USER_DISPATCH_THREADS_X`]: the lanes past a dispatch's
     /// count of threads leave at once, as the console never starts them.
@@ -1096,6 +1103,7 @@ fn emit_pruned(
         narrow_waves: options.narrow_waves,
         uav_size_level0: options.uav_size_level0,
         halves_rendezvous: options.halves_rendezvous,
+        halves_first_meet: options.halves_first_meet,
     };
     let (literal, limits) = (!options.disable_literal_halves, options.thread_limits);
     let (l, heap_index_sources) = match lower::lower_limited(
