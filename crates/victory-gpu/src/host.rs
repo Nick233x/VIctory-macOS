@@ -300,6 +300,41 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 static COPY_KINDS: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// Of the preparing's list steps (`HostList::run_deferred`), since the last
+/// frame-rate line, by [`STEP_NAMES`]: how many ran, and the microseconds
+/// of the kinds timed (one clock read each: the many refreshes and slots
+/// are only counted, their time is the rest of the phase).
+static STEPS: [std::sync::atomic::AtomicU64; 2 * STEP_NAMES.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2 * STEP_NAMES.len()];
+
+const STEP_NAMES: [&str; 8] = [
+    "title copies and fills",
+    "refreshes asked",
+    "table slots",
+    "host work",
+    "shader writes declared (snapshots, the refreshes they flush)",
+    "table textures",
+    "heap scans (bindless)",
+    "page tables (title memory)",
+];
+
+/// Notes a list step when dropped (each arm of `run_deferred` ends its own way).
+struct StepTimer(usize, Option<std::time::Instant>);
+
+impl Drop for StepTimer {
+    fn drop(&mut self) {
+        note_step(self.0, self.1);
+    }
+}
+
+/// Counts a list step of kind `kind`, and its microseconds if timed.
+fn note_step(kind: usize, started: Option<std::time::Instant>) {
+    STEPS[kind].fetch_add(1, Ordering::Relaxed);
+    if let Some(started) = started {
+        STEPS[STEP_NAMES.len() + kind].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Of the preparing, by phase ([`Phase`]), in microseconds since the last
 /// frame-rate line: where a submission's CPU time goes, so a frame report
 /// says which part to make faster. Read with [`take_phases`].
@@ -4936,6 +4971,19 @@ impl HostList {
             // diagnostics.
             let copy_started = matches!(step, Step::Copy(..) | Step::Move(..) | Step::Fill(..))
                 .then(std::time::Instant::now);
+            // The list-steps line: every step counted, all but the many
+            // refreshes and slots timed.
+            let step_kind = match step {
+                Step::Copy(..) | Step::Move(..) | Step::Fill(..) => 0,
+                Step::Refresh(..) => 1,
+                Step::Slot(..) => 2,
+                Step::Host(_) => 3,
+                Step::GpuWrite(..) => 4,
+                Step::Texture(..) => 5,
+                Step::Heap(_) => 6,
+                Step::Memory(_) => 7,
+            };
+            let _step = StepTimer(step_kind, (step_kind > 2).then(std::time::Instant::now));
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -6288,6 +6336,25 @@ impl Meter {
                 .map(|(name, us)| format!("{name} {:.1}", ms(us)))
                 .collect();
             tracing::info!("host preparing per frame by phase, ms: {}", phases.join(", "));
+            {
+                let n = STEPS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                let kinds = STEP_NAMES.len();
+                let parts: Vec<String> = STEP_NAMES
+                    .iter()
+                    .enumerate()
+                    .map(|(k, name)| {
+                        if k == 1 || k == 2 {
+                            format!("{name} {:.0}", n[k] as f64 / report_frames)
+                        } else {
+                            format!("{name} {:.0} ({:.1} ms)", n[k] as f64 / report_frames, ms(n[kinds + k]))
+                        }
+                    })
+                    .collect();
+                tracing::info!(
+                    "host list steps per frame (the rest of the phase is the refreshes and slots): {}",
+                    parts.join(", ")
+                );
+            }
             #[cfg(windows)]
             crate::descriptor::log_sync(report_frames);
             crate::shadow::log_refreshed(report_frames);
@@ -7360,6 +7427,26 @@ mod batch {
         super::same_copy::TEST_MODE.with(|m| m.set(mode));
         list.run_deferred(batch);
         super::same_copy::TEST_MODE.with(|m| m.set(0));
+    }
+
+    /// The list-steps line counts each step, and times host work.
+    #[test]
+    fn list_steps_are_counted_by_kind() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        list.defer_host(|| std::thread::sleep(std::time::Duration::from_millis(2)));
+        let before = super::STEPS[3].load(std::sync::atomic::Ordering::Relaxed);
+        let before_us = super::STEPS[super::STEP_NAMES.len() + 3].load(std::sync::atomic::Ordering::Relaxed);
+        list.run_deferred(&mut Batch::default());
+        // Another test's frame report may take the counts meanwhile.
+        let (after, after_us) = (
+            super::STEPS[3].load(std::sync::atomic::Ordering::Relaxed),
+            super::STEPS[super::STEP_NAMES.len() + 3].load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert!(after > before || after >= 1, "{before} then {after}");
+        assert!(after_us >= before_us + 2000 || after_us >= 2000, "{before_us} then {after_us} us");
     }
 
     /// The frame report's refreshed-copies line counts each copy's
