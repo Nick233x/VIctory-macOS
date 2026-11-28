@@ -197,6 +197,15 @@ pub fn run(
             println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
         }
     }
+    // A way out of a title lookup that can loop forever on a Mac
+    // (victory_loader::probe_guard); off unless asked for.
+    let guard_lookup = std::env::var("VICTORY_GUARD_LOOKUP").as_deref() == Ok("1");
+    if guard_lookup {
+        match victory_loader::probe_guard::patch(image.base() as u64) {
+            Ok(()) => println!("lookup guard   on: the lookup at +0x50eb750 gives up when its key is absent"),
+            Err(why) => println!("lookup guard   not applied: {why}"),
+        }
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
@@ -297,6 +306,9 @@ pub fn run(
     // run killed outright loses what it had recorded (VICTORY_PIPELINE_BOOK).
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    if guard_lookup {
+        victory_loader::probe_guard::watch();
+    }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
