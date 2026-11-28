@@ -35,12 +35,6 @@ mod half_views;
 mod halves;
 mod marks;
 mod meet;
-
-/// [`halves::FIRST_ACROSS`], for tests outside `lower`.
-#[cfg(test)]
-pub(super) fn halves_first_across() -> &'static str {
-    halves::FIRST_ACROSS
-}
 mod packed;
 mod round_mode;
 mod mesh;
@@ -66,6 +60,12 @@ pub(crate) use retry::lower_limited;
 pub(crate) use retry::{lower_literal, lower_pruned};
 
 type Why = &'static str;
+
+/// [`halves::FIRST_ACROSS`], for tests outside `lower`.
+#[cfg(test)]
+pub(super) fn halves_first_across() -> &'static str {
+    halves::FIRST_ACROSS
+}
 
 #[cfg(test)]
 thread_local! {
@@ -7626,7 +7626,7 @@ impl<'a> Lower<'a> {
                 if self.halves && !self.one_host_wave() && is_vec && !is_alike && !alone {
                     if !self.across_here() {
                         let w = inst.writes.first().map(|w| w.1);
-                        if let Some(w) = w {
+                        if let Some(w) = w.filter(|_| self.x.halves_first_meet) {
                             let a = s(self, 0)?;
                             if let Some(r) = self.first_meet(w, a, guard) {
                                 return self.write_i(inst, r?, None);

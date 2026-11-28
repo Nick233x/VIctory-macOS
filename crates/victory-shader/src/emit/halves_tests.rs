@@ -189,26 +189,26 @@ fn lower_halves_limited(
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
     let parts = lower::Parts {
-            native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            prims: Vec::new(),
-            mesh_stride: 0,
-            view_marks: false,
-            atomic_locks: false,
-            atomic_lock_rounds: false,
-            atomic_umax: false,
-            racy_minmax: false,
-            bias_as_gradients: false,
-            narrow_waves,
-            uav_size_level0: false,
-            halves_rendezvous: true,
-            halves_first_meet: FIRST_MEET.with(std::cell::Cell::get),
-            host_wave32,
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        racy_minmax: false,
+        bias_as_gradients: false,
+        narrow_waves,
+        uav_size_level0: false,
+        halves_rendezvous: true,
+        halves_first_meet: FIRST_MEET.with(std::cell::Cell::get),
+        host_wave32,
     };
     let threads = match &native.io {
         StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
@@ -3810,12 +3810,12 @@ fn first_beside_a_capped_loop(arm: Arm) -> Vec<u32> {
         0x4A08_0087, // v_add_nc_u32 v4, 7, v0
         0x7E02_02C1, // v_mov_b32 v1, -1
         0x7D88_00FF,
-        64,          // v_cmp_gt_u32 vcc, 64, v0
-        0xBF87_0001, // s_cbranch_vccnz -> the loop
-        0xBF82_0005, // s_branch -> beside it
-        0xBE95_0380, // s_mov_b32 s21, 0
-        0x8015_8115, // s_add_u32 s21, s21, 1
-        0xBF06_8315, // s_cmp_eq_u32 s21, 3
+        64,                                      // v_cmp_gt_u32 vcc, 64, v0
+        0xBF87_0001,                             // s_cbranch_vccnz -> the loop
+        0xBF82_0005,                             // s_branch -> beside it
+        0xBE95_0380,                             // s_mov_b32 s21, 0
+        0x8015_8115,                             // s_add_u32 s21, s21, 1
+        0xBF06_8315,                             // s_cmp_eq_u32 s21, 3
         0xBF85_0000 | (1 + beside.len() as u32), // s_cbranch_scc1 -> the join
         0xBF82_FFFC, // s_branch -> the loop's header (unconditional back edge)
     ]);
@@ -3832,7 +3832,9 @@ fn console_first_beside(l: u32, threads: u32, arm: Arm) -> u32 {
     if wave == 0 || !arm.takes(l) {
         return u32::MAX;
     }
-    (wave..end).find(|&t| arm.takes(t)).map_or(u32::MAX, |t| t + 7)
+    (wave..end)
+        .find(|&t| arm.takes(t))
+        .map_or(u32::MAX, |t| t + 7)
 }
 
 /// A first-lane read beside a capped loop, where no group barrier can go:
@@ -3842,31 +3844,47 @@ fn console_first_beside(l: u32, threads: u32, arm: Arm) -> u32 {
 /// there), in both, in a console wave with no upper half (96 threads).
 #[test]
 fn first_lane_reads_in_divergent_code_meet_between_halves() {
-    let arms = [Arm::Below(80), Arm::Above(111), Arm::Above(70), Arm::Below(200), Arm::Above(160)];
+    let arms = [
+        Arm::Below(80),
+        Arm::Above(111),
+        Arm::Above(70),
+        Arm::Below(200),
+        Arm::Above(160),
+    ];
     let mut failed = Vec::new();
     let mut refused = 0;
     for arm in arms {
         let words = first_beside_a_capped_loop(arm);
         for threads in [96u32, 128, 256] {
             let n = native(&words, true, threads, 0);
-            let off = lowered(&n, true).err().map(|e| e.to_string()).unwrap_or_else(|| "translated".into());
+            let off = lowered(&n, true)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "translated".into());
             if off.contains(super::lower::halves_first_across()) {
                 refused += 1;
             }
             let on = match with_first_meet(|| lowered(&n, true)) {
                 Ok(l) => l,
                 Err(e) => {
-                    failed.push(format!("{arm:?} {threads}: refused with first meets: {e} (without: {off})"));
+                    failed.push(format!(
+                        "{arm:?} {threads}: refused with first meets: {e} (without: {off})"
+                    ));
                     continue;
                 }
             };
             assert_eq!(on.wave_size, Some(32));
-            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-                v.validate(&mut on.dxil.clone()).expect("DXIL validation failed");
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut on.dxil.clone())
+                    .expect("DXIL validation failed");
             }
             #[cfg(windows)]
             {
-                let want: Vec<u32> = (0..threads).map(|l| console_first_beside(l, threads, arm)).collect();
+                let want: Vec<u32> = (0..threads)
+                    .map(|l| console_first_beside(l, threads, arm))
+                    .collect();
                 for msg in with_first_meet(|| differences(&words, threads, 1, &want)) {
                     failed.push(format!("{arm:?} {threads}: {msg}"));
                 }
@@ -3874,7 +3892,10 @@ fn first_lane_reads_in_divergent_code_meet_between_halves() {
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
-    assert!(refused > 0, "no case is refused without first meets: the test does not reach them");
+    assert!(
+        refused > 0,
+        "no case is refused without first meets: the test does not reach them"
+    );
 }
 
 #[test]

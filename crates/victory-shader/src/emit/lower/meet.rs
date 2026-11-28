@@ -641,21 +641,23 @@ impl Lower<'_> {
         }
     }
 
-    /// What each half of this lane's console wave gives as `own` at the
-    /// divergent site `site` (a dword the same in every lane of the host
-    /// wave): (lower half's, upper half's), the other's `missing` where it
-    /// has no lane there (see the module notes). Lowered at [`Lower::cur`],
-    /// which moves past the wait.
     /// A first-lane read of `a` (written as `w`) in divergent code, with
     /// `active` its lanes: the console wave's first active lane's value,
     /// met between the halves. `None` where it cannot meet; in a first
     /// pass the site is noted and a stand-in returned.
-    pub(super) fn first_meet(&mut self, w: Value, a: V, active: Option<V>) -> Option<Result<V, Why>> {
+    pub(super) fn first_meet(
+        &mut self,
+        w: Value,
+        a: V,
+        active: Option<V>,
+    ) -> Option<Result<V, Why>> {
         if !self.x.halves_first_meet {
             return None;
         }
         let (has, value) = (MeetSite::First(w, 0), MeetSite::First(w, 1));
-        if !self.meet_layout.slots.contains_key(&has) || !self.meet_layout.slots.contains_key(&value) {
+        if !self.meet_layout.slots.contains_key(&has)
+            || !self.meet_layout.slots.contains_key(&value)
+        {
             let b = self.cur_ir;
             if self.meet_later(has, b) && self.meet_later(value, b) {
                 return Some(Ok(self.s.m.i32(0)));
@@ -670,7 +672,9 @@ impl Lower<'_> {
             Some(act) => {
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
+                let r = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[act]);
                 self.s.flags |= flags::WAVE_OPS;
                 let lanes = self.s.m.extract(c, r, 0);
                 let any = self.s.m.cmp(c, pred::NE, lanes, zero);
@@ -688,6 +692,11 @@ impl Lower<'_> {
         Some(r)
     }
 
+    /// What each half of this lane's console wave gives as `own` at the
+    /// divergent site `site` (a dword the same in every lane of the host
+    /// wave): (lower half's, upper half's), the other's `missing` where it
+    /// has no lane there (see the module notes). Lowered at [`Lower::cur`],
+    /// which moves past the wait.
     pub(super) fn meet_halves(
         &mut self,
         site: MeetSite,

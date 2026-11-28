@@ -869,8 +869,14 @@ mod tests {
     #[test]
     #[ignore = "a probe over shaders copied by hand"]
     fn probe_translate_folder() {
-        let Some(dir) = std::env::var_os("VICTORY_PROBE_SHADERS") else { return };
-        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+        let Some(dir) = std::env::var_os("VICTORY_PROBE_SHADERS") else {
+            return;
+        };
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
         paths.sort();
         for p in paths {
             let bytes = std::fs::read(&p).unwrap();
