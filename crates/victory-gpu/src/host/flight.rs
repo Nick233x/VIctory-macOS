@@ -868,6 +868,7 @@ impl Host {
 
         *submitted += 1;
         debug_assert_eq!(*submitted, fence_value);
+        super::SUBMISSIONS_BEGUN.store(*submitted, Ordering::Release);
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::SUBMITTED, fence_value, 0);
 
