@@ -197,6 +197,40 @@ pub fn run(
             println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
         }
     }
+    // A way out of a title lookup that can loop forever on a Mac
+    // (victory_loader::probe_guard); off unless asked for.
+    let guard_lookup = std::env::var("VICTORY_GUARD_LOOKUP").as_deref() == Ok("1");
+    if guard_lookup {
+        match victory_loader::probe_guard::patch(image.base() as u64) {
+            Ok(()) => println!("lookup guard   on: the lookup at +0x50eb750 gives up when its key is absent"),
+            Err(why) => println!("lookup guard   not applied: {why}"),
+        }
+    }
+    // The longest step the title's clamped timers take in a
+    // frame, made longer (victory_loader::time_step); off unless asked for.
+    if let Some(seconds) =
+        victory_loader::time_step::wanted(std::env::var(victory_loader::time_step::SWITCH).ok().as_deref())
+    {
+        match victory_loader::time_step::patch(image.base() as u64, seconds) {
+            Ok(step) => println!(
+                "time step      on: the title's clamped timers step up to {step} s a frame (the title's 1/15 s; asked for {seconds})"
+            ),
+            Err(why) => println!("time step      not applied: {why}"),
+        }
+    }
+    // The title's time budget for placing map pieces, made
+    // larger (victory_loader::map_budget); off unless asked for.
+    if let Some(k) = victory_loader::map_budget::wanted(std::env::var(victory_loader::map_budget::SWITCH).ok().as_deref())
+    {
+        match victory_loader::map_budget::patch(image.base() as u64, k) {
+            Ok(()) => println!(
+                "map budget     on: {} to {} us a frame for placing map pieces (the title's limits times {k})",
+                250 * k,
+                1250 * k
+            ),
+            Err(why) => println!("map budget     not applied: {why}"),
+        }
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
@@ -297,6 +331,9 @@ pub fn run(
     // run killed outright loses what it had recorded (VICTORY_PIPELINE_BOOK).
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    if guard_lookup {
+        victory_loader::probe_guard::watch();
+    }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
