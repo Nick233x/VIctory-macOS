@@ -1010,9 +1010,20 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// `VICTORY_DROP_WHY=1` (always in diagnostics builds): draws and
+/// dispatches dropped for want of a host pipeline are counted by why, and
+/// the frame report lists the reasons (the shaders that do not translate,
+/// the host's refusal, a prepare step that failed), most first. Off, only
+/// their total is counted.
+#[cfg(windows)]
+pub(crate) fn drop_why() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") || crate::switch::on("VICTORY_DROP_WHY"))
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// ([`drop_why`]).
+#[cfg(windows)]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
@@ -1127,7 +1138,7 @@ pub(crate) fn traced_dispatch(this: This) -> Option<String> {
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn shaders_of(this: This) -> String {
     if this.is_null() {
         return "no pipeline".into();
@@ -1136,26 +1147,27 @@ pub(crate) fn shaders_of(this: This) -> String {
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
+/// for want of a host pipeline ([`drop_why`]). `kind` names the command
+/// when its pipeline has a host one: it was dropped for its bound target
+/// formats, whose pipeline is apart.
+#[cfg(windows)]
+pub(crate) fn note_drop(this: This, kind: &str) {
     let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
+        "no pipeline set".to_owned()
     } else {
         let p = pipeline(this);
-        p.host
-            .skipped_shader
-            .as_deref()
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+        make::missing(&p.host).unwrap_or_else(|| {
+            format!(
+                "{kind}: no host pipeline for its bound target formats {:?}",
+                p.shaders
+            )
+        })
     };
-    if let Some(why) = why {
-        note_why(why);
-    }
+    note_why(why);
 }
 
-/// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Counts a draw or dispatch dropped for `why` ([`drop_why`]).
+#[cfg(windows)]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops
@@ -1164,8 +1176,8 @@ pub(crate) fn note_why(why: String) {
         .or_default() += 1;
 }
 
-/// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The drops counted since the last call, most first ([`drop_why`]).
+#[cfg(windows)]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
@@ -1684,6 +1696,64 @@ mod tests {
         for q in [p, other] {
             slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
         }
+    }
+
+    /// A drop is counted by why (`VICTORY_DROP_WHY`, here called directly):
+    /// a pipeline whose shader does not translate names that shader, one
+    /// never set says so, and the reasons come most first.
+    #[cfg(windows)]
+    #[test]
+    fn drops_are_counted_by_why() {
+        let code = [0xD1u8; 64];
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode {
+                code: code.as_ptr(),
+                size: code.len(),
+            },
+        };
+        let mut p: This = std::ptr::null();
+        assert_eq!(
+            create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        // Its first use starts it; not a container, it is refused.
+        assert!(host_pipeline(p).is_none());
+        let made = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host).is_some()
+        });
+        assert!(made, "its host pipeline was started");
+        let hash = pipeline(p).shaders[0].hash.clone();
+        let reason = "drops_are_counted_by_why: three";
+        for _ in 0..3 {
+            note_why(reason.to_owned());
+        }
+        note_drop(p, "dispatch");
+        note_drop(std::ptr::null(), "dispatch");
+        let drops = take_drops();
+        let count = |pred: &dyn Fn(&str) -> bool| {
+            drops
+                .iter()
+                .filter(|(why, _)| pred(why))
+                .map(|(_, n)| *n)
+                .sum::<u64>()
+        };
+        assert_eq!(count(&|why| why == reason), 3);
+        assert!(
+            count(&|why| why.contains(&hash)) >= 1,
+            "the untranslated shader is named: {drops:?}"
+        );
+        assert!(count(&|why| why == "no pipeline set") >= 1, "{drops:?}");
+        assert!(
+            drops.windows(2).all(|w| w[0].1 >= w[1].1),
+            "most first: {drops:?}"
+        );
+        assert!(
+            take_drops().iter().all(|(why, _)| why != reason),
+            "taken once"
+        );
+        slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
     }
 
     #[test]
