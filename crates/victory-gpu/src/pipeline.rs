@@ -941,10 +941,30 @@ pub(crate) fn bound(this: This) {
 /// (its first use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// `VICTORY_NO_DRAWS=1`: no host pipeline is made and no shader is
+/// translated, so every draw and dispatch of the title is dropped. The title
+/// runs as before (its code, streaming and memory) and the picture stays
+/// black. The frame time is then the title's own code and our system
+/// services, the ceiling that no graphics work can raise. On a Mac that
+/// measures what Rosetta and Wine cost apart from the GPU path. After the
+/// switch of the same name in stellarr-studio/kelvaroq (patch 0061), which
+/// took it from Cold Project VI.
+#[cfg(windows)]
+pub(crate) fn no_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_NO_DRAWS");
+        if on {
+            tracing::warn!("VICTORY_NO_DRAWS=1: no pipelines, no shaders, nothing of the title drawn");
+        }
+        on
+    })
 }
 
 /// As [`host_pipeline`], for a draw into render target and depth views of
@@ -954,7 +974,7 @@ pub(crate) fn host_pipeline_for<'a>(
     this: This,
     bound: &host::TargetFormats,
 ) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
     let p = &pipeline(this).host;
@@ -1226,7 +1246,9 @@ fn hand_out(
     #[cfg(windows)]
     known::note(&make::key(&shaders, host.graphics.as_deref()), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
-    make::early(&host);
+    if !no_draws() {
+        make::early(&host);
+    }
     #[cfg(windows)]
     if builder {
         builder::note(&host);
