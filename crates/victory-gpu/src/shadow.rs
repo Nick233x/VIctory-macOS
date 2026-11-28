@@ -2923,6 +2923,10 @@ const IDLE_FRAMES: u64 = 60;
 struct Released {
     starts: std::collections::HashSet<u64>,
     remade: u64,
+    /// How often the copy at each title address was given up and then
+    /// made again (at most [`MOST_BOUNCES`]): a scene the title keeps
+    /// coming back to (`VICTORY_RELEASE_TARGETED`).
+    bounces: std::collections::HashMap<u64, u8>,
 }
 
 impl Released {
@@ -2931,6 +2935,11 @@ impl Released {
     fn remade(&mut self, start: u64) {
         if self.starts.remove(&start) {
             self.remade += 1;
+            if self.bounces.len() > Self::CAP {
+                self.bounces.clear();
+            }
+            let b = self.bounces.entry(start).or_default();
+            *b = (*b + 1).min(MOST_BOUNCES);
         }
     }
 }
@@ -2939,6 +2948,34 @@ static RELEASED: std::sync::LazyLock<Mutex<Released>> = std::sync::LazyLock::new
 
 fn released() -> std::sync::MutexGuard<'static, Released> {
     RELEASED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The most times a copy's grace doubles ([`idle_frames_for`]): 16 times
+/// [`IDLE_FRAMES`].
+const MOST_BOUNCES: u8 = 4;
+
+/// The presented frames a copy given up and made again `bounces` times
+/// must go unasked for before [`release_idle`] gives it up again under
+/// `VICTORY_RELEASE_TARGETED=1`: [`IDLE_FRAMES`], doubled for each time.
+/// At 3 frames a second, 60 frames are 20 s, and copies of a scene the
+/// title came back to every half minute went and were made again: 1,000-1,500
+/// of the 6,000 copies given up in a world run (runs I, K1b, K2).
+fn idle_frames_for(bounces: u8) -> u64 {
+    IDLE_FRAMES << bounces.min(MOST_BOUNCES)
+}
+
+/// `VICTORY_RELEASE_TARGETED=1`: while memory runs low, copies that were
+/// given up and made again before wait longer ([`idle_frames_for`]) and go
+/// after those that never came back. Off by default.
+fn targeted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RELEASE_TARGETED").is_some_and(|v| v != "0");
+        if on {
+            tracing::info!("copies made again after being given up wait longer before going again (VICTORY_RELEASE_TARGETED)");
+        }
+        on
+    })
 }
 
 /// Whether [`release_idle`] runs: `VICTORY_RELEASE_COPIES=0` turns it off.
@@ -2962,7 +2999,12 @@ fn settled(copy: &Arc<Shadow>, tables: usize) -> bool {
 /// Whether `copy` can go while memory runs low: [`settled`], and no view
 /// or list asked for it in [`IDLE_FRAMES`] frames.
 fn idle(copy: &Arc<Shadow>, tables: usize, frame: u64) -> bool {
-    frame.saturating_sub(copy.used.load(Ordering::Relaxed)) >= IDLE_FRAMES && settled(copy, tables)
+    idle_for(copy, tables, frame, IDLE_FRAMES)
+}
+
+/// [`idle`] with `frames` unasked frames in place of [`IDLE_FRAMES`].
+fn idle_for(copy: &Arc<Shadow>, tables: usize, frame: u64, frames: u64) -> bool {
+    frame.saturating_sub(copy.used.load(Ordering::Relaxed)) >= frames && settled(copy, tables)
 }
 
 /// When a copy was last asked for, or the time now: milliseconds
@@ -3037,6 +3079,7 @@ fn take_idle(
     want: u64,
     tables: usize,
     idle: impl Fn(&Arc<Shadow>, usize) -> bool,
+    rank: impl Fn(&Arc<Shadow>) -> u64,
 ) -> Vec<Arc<Shadow>> {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     let mut map = buffers();
@@ -3046,14 +3089,14 @@ fn take_idle(
         Buffer((u64, usize)),
         Loose((u64, u64)),
     }
-    let mut candidates: Vec<(u64, u64, Held)> = map
+    let mut candidates: Vec<((u64, u64), u64, Held)> = map
         .iter()
         .filter_map(|(&key, e)| e.shadow.as_ref().map(|c| (Held::Buffer(key), c)))
         .chain(loose.iter().map(|(&key, c)| (Held::Loose(key), c)))
         .filter(|(_, c)| idle(c, tables))
-        .map(|(held, c)| (c.used.load(Ordering::Relaxed), c.len, held))
+        .map(|(held, c)| ((rank(c), c.used.load(Ordering::Relaxed)), c.len, held))
         .collect();
-    candidates.sort_unstable_by_key(|&(used, ..)| used);
+    candidates.sort_unstable_by_key(|&(order, ..)| order);
     let mut taken = 0;
     for (_, len, held) in candidates {
         if taken >= want {
@@ -3100,9 +3143,23 @@ pub(crate) fn release_idle(frame: u64, want: u64) -> (usize, u64) {
     if want == 0 || !release_enabled() {
         return (0, 0);
     }
-    let gone = take_idle(want, crate::memory::tables(), |c, tables| {
-        idle(c, tables, frame)
-    });
+    let gone = if targeted() {
+        let bounces = released().bounces.clone();
+        let of = |c: &Arc<Shadow>| bounces.get(&c.start).copied().unwrap_or(0);
+        take_idle(
+            want,
+            crate::memory::tables(),
+            |c, tables| idle_for(c, tables, frame, idle_frames_for(of(c))),
+            |c| u64::from(of(c)),
+        )
+    } else {
+        take_idle(
+            want,
+            crate::memory::tables(),
+            |c, tables| idle(c, tables, frame),
+            |_| 0,
+        )
+    };
     let (count, bytes, remade) = note_released(&gone);
     if count > 0 {
         tracing::info!(
@@ -3162,7 +3219,12 @@ fn release_stale_at(
     if !any {
         return (0, 0);
     }
-    let gone = take_idle(u64::MAX, tables, |c, tables| pick(c) && settled(c, tables));
+    let gone = take_idle(
+        u64::MAX,
+        tables,
+        |c, tables| pick(c) && settled(c, tables),
+        |_| 0,
+    );
     let (count, bytes, remade) = note_released(&gone);
     if count > 0 {
         tracing::debug!(
@@ -3335,6 +3397,91 @@ pub(crate) mod tests {
             assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
         }
         unregister(p, p as u64);
+    }
+
+    /// `VICTORY_RELEASE_TARGETED`: each time a copy was made again after
+    /// going doubles the frames it must go unasked for, up to 16 times.
+    #[test]
+    fn a_copy_that_came_back_waits_longer_each_time() {
+        assert_eq!(
+            [0, 1, 2, 4, 5, u8::MAX].map(idle_frames_for),
+            [
+                IDLE_FRAMES,
+                2 * IDLE_FRAMES,
+                4 * IDLE_FRAMES,
+                16 * IDLE_FRAMES,
+                16 * IDLE_FRAMES,
+                16 * IDLE_FRAMES
+            ]
+        );
+        let mut r = Released::default();
+        r.starts.extend([1, 2]);
+        r.remade(1);
+        r.remade(3); // never given up: not counted
+        assert_eq!(
+            (r.remade, r.bounces.get(&1), r.bounces.get(&3)),
+            (1, Some(&1), None)
+        );
+        for _ in 0..10 {
+            r.starts.insert(1);
+            r.remade(1);
+        }
+        assert_eq!(r.bounces[&1], MOST_BOUNCES, "capped");
+    }
+
+    /// Under `VICTORY_RELEASE_TARGETED`, a copy that came back before stays
+    /// past [`IDLE_FRAMES`] while one that never came back goes; once both
+    /// are past its longer grace, the one that never came back goes first.
+    #[test]
+    fn a_copy_that_came_back_goes_later_and_last() {
+        let p = crate::watch::tests::pool(2);
+        let at = |i: usize| p + i * PAGE;
+        for i in 0..2 {
+            register(at(i), at(i) as u64, PAGE as u64);
+        }
+        let done = || (0..2).for_each(|i| unregister(at(i), at(i) as u64));
+        let copies: Vec<_> = (0..2)
+            .filter_map(|i| find(at(i) as u64, PAGE as u64))
+            .collect();
+        let Ok([fresh, back]) = <[_; 2]>::try_from(copies) else {
+            done();
+            return; // no host GPU here
+        };
+        let asked = 1 << 20;
+        fresh.used.store(asked, Ordering::Relaxed);
+        back.used.store(asked, Ordering::Relaxed);
+        let mine = |c: &Arc<Shadow>| (p as u64..at(2) as u64).contains(&c.start);
+        let bounces: std::collections::HashMap<u64, u8> = [(at(1) as u64, 1)].into();
+        let of = |c: &Arc<Shadow>| bounces.get(&c.start).copied().unwrap_or(0);
+        let take = |frame: u64, want: u64| {
+            take_idle(
+                want,
+                0,
+                |c, t| mine(c) && idle_for(c, t, frame, idle_frames_for(of(c))),
+                |c| u64::from(of(c)),
+            )
+        };
+        drop((fresh, back));
+        let gone = take(asked + IDLE_FRAMES, u64::MAX);
+        assert_eq!(
+            gone.iter().map(|c| c.start).collect::<Vec<_>>(),
+            [at(0) as u64],
+            "only the one that never came back"
+        );
+        drop(gone);
+        // Made again, then both unasked past the longer grace: asked for
+        // one page, the one that never came back goes, the other stays.
+        let again = find(at(0) as u64, PAGE as u64).expect("made again");
+        again.used.store(asked, Ordering::Relaxed);
+        drop(again);
+        let gone = take(asked + 2 * IDLE_FRAMES, PAGE as u64);
+        assert_eq!(
+            gone.iter().map(|c| c.start).collect::<Vec<_>>(),
+            [at(0) as u64],
+            "the one that never came back first"
+        );
+        drop(gone);
+        done();
     }
 
     /// A copy may go only when nothing else holds it, no submission's writes
