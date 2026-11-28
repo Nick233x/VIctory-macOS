@@ -933,6 +933,10 @@ pub(crate) struct HostTexture {
     /// A heap slot views it for unordered access (`VICTORY_EVICT_HEAP_UAV`):
     /// written by the GPU once shaders write through heaps.
     heap_writable: std::sync::atomic::AtomicBool,
+    /// Eviction gave it up ([`give_up`]): its title textures make a new one
+    /// when next asked. Copies of it kept elsewhere (the heaps' cached walk,
+    /// `crate::bindless`) ask for the new one then.
+    given_up: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -989,6 +993,7 @@ impl HostTexture {
             host_written: false.into(),
             gpu_written: false.into(),
             heap_writable: false.into(),
+            given_up: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             flags: desc.Flags.0 as u32,
@@ -1032,6 +1037,12 @@ impl HostTexture {
     /// `state` without the bits its flags forbid (`crate::host::legal_state`).
     pub(crate) fn legal_state(&self, state: u32) -> u32 {
         crate::host::legal_for(self.flags, state)
+    }
+
+    /// Whether eviction gave it up (its title textures have another now,
+    /// or none until asked again).
+    pub(crate) fn is_given_up(&self) -> bool {
+        self.given_up.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The title used it now: a list of the title's names it, or a shader
@@ -2314,6 +2325,10 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
 /// shortcut: a use racing this (a title thread recording) may view the
 /// texture made again in a list that moved the one given up; the pass
 /// gives up only textures unused for a while, or the least recently used.
+/// Times eviction gave host textures up ([`give_up`]).
+#[cfg(windows)]
+pub(crate) static GIVE_UPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(windows)]
 fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2331,7 +2346,12 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
     let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
+    // Before any of them can go: what the heaps' cached walk keeps of them
+    // (their trackers' bits, which a tracker made later may take) is looked
+    // at again (`crate::bindless`).
+    GIVE_UPS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     for (t, owners) in gone {
+        t.given_up.store(true, std::sync::atomic::Ordering::Release);
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
