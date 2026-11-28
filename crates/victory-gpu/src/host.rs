@@ -6644,6 +6644,7 @@ impl Meter {
             // submit worker did instead, and how long the host GPU waited.
             flight::log_frame(report_frames);
             crate::queue::log_drains(report_frames);
+            crate::queue::log_title_gap();
             let phases: Vec<String> = PHASE_NAMES
                 .iter()
                 .zip(take_phases())

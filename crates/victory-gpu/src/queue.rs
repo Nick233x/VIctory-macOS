@@ -140,6 +140,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        title_submits();
         let mut held = held_for(Why::Submission);
         let entered = std::time::Instant::now();
         for &l in lists {
@@ -661,6 +662,82 @@ pub(crate) const WHY_NAMES: [&str; 7] = [
 ];
 #[cfg(windows)]
 const _: () = assert!(Why::Timer as usize + 1 == WHY_NAMES.len());
+
+/// The title's time from a present returning to its next submission
+/// (`ExecuteCommandLists`), the floor of what its CPU work costs a frame:
+/// microseconds, and of them the time its threads were held in our queue
+/// work meanwhile ([`BLOCKED_US`], all title threads), since the last frame
+/// report; then frames measured. The rest is the title's own work, its
+/// calls into our command lists and other functions included.
+#[cfg(windows)]
+static TITLE_GAP: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// When the last present returned (microseconds since [`epoch_us`]; 0 once
+/// a submission closed the gap), and the queue work held then.
+#[cfg(windows)]
+static PRESENT_RETURNED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+fn epoch_us() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// The title threads' time held in our queue work, all of it ([`BLOCKED_US`]
+/// but our timer's).
+#[cfg(windows)]
+fn held_total() -> u64 {
+    BLOCKED_US[..Why::Timer as usize]
+        .iter()
+        .flat_map(|w| w.iter())
+        .map(|a| a.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Notes a present returning to the title when dropped.
+#[cfg(windows)]
+struct PresentReturning;
+
+#[cfg(windows)]
+impl Drop for PresentReturning {
+    fn drop(&mut self) {
+        PRESENT_RETURNED[1].store(held_total(), Ordering::Relaxed);
+        PRESENT_RETURNED[0].store(epoch_us(), Ordering::Release);
+    }
+}
+
+/// The title submits: the first submission since a present closes its gap.
+#[cfg(windows)]
+fn title_submits() {
+    let returned = PRESENT_RETURNED[0].swap(0, Ordering::AcqRel);
+    if returned == 0 {
+        return;
+    }
+    let gap = epoch_us().saturating_sub(returned);
+    // `take_blocked` may have cleared the counters meanwhile: then nothing
+    // is subtracted.
+    let held = held_total().saturating_sub(PRESENT_RETURNED[1].load(Ordering::Relaxed)).min(gap);
+    TITLE_GAP[0].fetch_add(gap, Ordering::Relaxed);
+    TITLE_GAP[1].fetch_add(held, Ordering::Relaxed);
+    TITLE_GAP[2].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The frame report's line for [`TITLE_GAP`], per frame measured.
+#[cfg(windows)]
+pub(crate) fn log_title_gap() {
+    let [us, held, frames] = TITLE_GAP.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    if frames == 0 {
+        return;
+    }
+    let ms = |us: u64| us as f64 / 1e3 / frames as f64;
+    tracing::info!(
+        "title CPU from a present returning to its next submission, ms per frame: {:.1}, of it held in our \
+         queue work {:.1}, so the title's own (its calls into our command lists included) {:.1}",
+        ms(us),
+        ms(held),
+        ms(us - held),
+    );
+}
 
 /// [`BLOCKED_US`] since the last call, cleared: for each [`Why`], the
 /// microseconds waiting for the queues' lock and in the pump.
@@ -1238,6 +1315,9 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // The title's own time starts when this returns (`TitleGap`).
+    #[cfg(windows)]
+    let _returning = PresentReturning;
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
@@ -1568,6 +1648,23 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 
 #[cfg(test)]
 mod tests {
+
+    /// The title's gap runs from a present returning to its next submission,
+    /// once a present: later submissions add nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_title_gap_runs_from_a_present_to_the_next_submission() {
+        let before = super::TITLE_GAP.each_ref().map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+        drop(super::PresentReturning);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        super::title_submits();
+        super::title_submits();
+        let after = super::TITLE_GAP.each_ref().map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+        // Other tests present and submit too, and the frame report takes the
+        // counts: only what this one adds at least is checked.
+        assert!(after[2] > before[2] || after[2] >= 1, "a frame measured");
+        assert!(after[0] >= before[0] + 5_000 || after[0] >= 5_000, "{} then {} us", before[0], after[0]);
+    }
     use super::*;
     use crate::object::slot;
 
