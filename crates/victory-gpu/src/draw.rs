@@ -500,35 +500,41 @@ pub(crate) fn take_held() -> u64 {
 }
 static HELD: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host, counts it by why
-/// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
-/// it in the list (diagnostics).
-#[cfg(feature = "diagnostics")]
+/// Counts a draw or dispatch not run on the host by why
+/// ([`crate::pipeline::drop_why`]): the reason [`not_run`] gave, if its
+/// pipeline has a host one, else why it has none. In diagnostics builds,
+/// also marks the last traced draw as not run and notes it in the list.
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
     let why = NOT_RUN.with(|w| w.replace(""));
-    if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
-        crate::pipeline::note_drop(pipeline as This);
-    } else {
-        crate::pipeline::note_why(format!("{kind}: {why} {}", crate::pipeline::shaders_of(pipeline as This)));
+    if crate::pipeline::drop_why() {
+        if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
+            crate::pipeline::note_drop(pipeline as This, kind);
+        } else {
+            crate::pipeline::note_why(format!(
+                "{kind}: {why} {}",
+                crate::pipeline::shaders_of(pipeline as This)
+            ));
+        }
     }
-    list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
-        last.push_str(" DROPPED");
+    #[cfg(feature = "diagnostics")]
+    {
+        list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
+        if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
+            last.push_str(" DROPPED");
+        }
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = list;
 }
 
-#[cfg(feature = "diagnostics")]
 thread_local! {
     /// Why the draw or dispatch this thread last prepared cannot run.
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
-/// Notes why the draw or dispatch being prepared cannot run (diagnostics).
+/// Notes why the draw or dispatch being prepared cannot run ([`dropped`]).
 fn not_run(why: &'static str) {
-    #[cfg(feature = "diagnostics")]
     NOT_RUN.with(|w| w.set(why));
-    #[cfg(not(feature = "diagnostics"))]
-    let _ = why;
 }
 
 /// The title commands counted by kind (and, for measuring only, left out
@@ -1721,7 +1727,6 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         };
@@ -1753,7 +1758,6 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         }
@@ -2045,7 +2049,6 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "mesh");
         }
     }
@@ -2677,7 +2680,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "draw");
         }
     }
@@ -2777,7 +2779,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "indexed");
         }
     }
@@ -2834,7 +2835,7 @@ impl State {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(self.pipeline as This, "indirect");
             list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}", crate::pipeline::shaders_of(self.pipeline as This)));
             return Some(false);
         }
@@ -2899,7 +2900,7 @@ impl State {
         }
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop(self.pipeline as This, "indirect");
             why("no host pipeline");
             return Some(false);
         }
@@ -2989,10 +2990,14 @@ impl State {
             if let Some((clamped, _)) = &inline_clamped {
                 crate::indirect::done(list, clamped);
             }
+            // Indirect calls are counted apart; their reason must not
+            // linger for the next direct drop ([`dropped`]).
+            #[cfg(not(feature = "diagnostics"))]
+            NOT_RUN.with(|w| w.set(""));
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
+                    crate::pipeline::note_drop(self.pipeline as This, "indirect");
                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
                 }
                 Some(p) => why(&format!(
@@ -6175,7 +6180,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(copy);
         // A slot made from the view holds its copy: after more than a
         // thousand other views' copies, draws still find (and refresh) the
-        // copy the slot shows; rewritten, the slot lets it go.
+        // copy the slot shows; rewritten, the old copy retires after GPU work.
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
         let mut heap = null;
@@ -6192,8 +6197,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         let found = crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0;
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
-        slots.make_null(0);
-        assert!(shown.upgrade().is_none(), "released with the slot");
+        let list = host.new_list().expect("retirement submission");
+        list.close();
+        crate::host::with_bury_lag(0, || {
+            slots.make_null(0);
+            host.execute(&[&list]);
+        });
+        crate::host::wait_for_releases();
+        assert!(shown.upgrade().is_none(), "released after retirement");
     }
 
     #[test]
