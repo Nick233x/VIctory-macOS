@@ -2915,7 +2915,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// when the title releases it.
     #[test]
     fn the_cached_walk_follows_the_textures_viewed() {
-        let mut inner = Inner::new(false, false);
+        let mut inner = Inner::new(false, false, false);
         inner.walk = Some(Walk::default());
         let walked = |inner: &Inner| {
             let w = inner.walk.as_ref().unwrap();
