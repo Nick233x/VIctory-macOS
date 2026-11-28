@@ -6776,7 +6776,6 @@ impl Meter {
                     crate::resource::SOON_FRAMES,
                 );
                 // Window caption updates leave the report counters intact.
-                let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
                 log_gpu_walls(report_frames);
@@ -6813,12 +6812,14 @@ impl Meter {
                         shed as f64 / 1e6
                     );
                 }
-                for (why, n) in drops.iter().take(40) {
-                    tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / report_frames
-                    );
-                }
+            }
+            // By why, with `VICTORY_DROP_WHY=1` (`crate::pipeline::drop_why`).
+            #[cfg(windows)]
+            for (why, n) in crate::pipeline::take_drops().iter().take(40) {
+                tracing::info!(
+                    "dropped {:.1}/frame without a host pipeline: {why}",
+                    *n as f64 / report_frames
+                );
             }
         }
         if self.caption.is_none() {
